@@ -1,0 +1,1242 @@
+import asyncio
+import struct
+import threading
+import logging
+import os
+import sys
+import traceback
+from datetime import datetime
+from typing import Optional
+
+try:
+    from PySide6 import QtCore
+except ImportError as e:
+    raise SystemExit("PySide6 is required. Install with: pip install PySide6") from e
+
+try:
+    from bleak import BleakClient, BleakScanner
+    BLE_AVAILABLE = True
+except Exception:
+    BLE_AVAILABLE = False
+
+
+UART_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+UART_TX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  # Write
+UART_RX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # Notify
+ERROR_CHAR_UUID = "33b65d43-611c-11ed-9b6a-0242ac120002"  # Notify
+
+
+class QtExoDeviceManager(QtCore.QObject):
+    """
+    Qt-native device manager for BLE (standalone for the Qt app).
+    - Keeps Python_GUI/Device/ code untouched
+    - Emits Qt signals for UI/pages to consume
+    - Provides minimal BLE: scan/connect/disconnect/notify/write
+    """
+
+    connected = QtCore.Signal(str, str)     # name, address
+    disconnected = QtCore.Signal()
+    error = QtCore.Signal(str)
+    log = QtCore.Signal(str)
+    dataReceived = QtCore.Signal(bytes)     # raw bytes from UART RX notify
+    deviceErrorReceived = QtCore.Signal(str)  # error messages from ErrorChar notify
+    scanResults = QtCore.Signal(list)       # list[(name, address)]
+    scanProgress = QtCore.Signal(int)       # scan progress percentage (0-100)
+    connectScanProgress = QtCore.Signal(int) # scanning phase during connection (0-100)
+    connectionProgress = QtCore.Signal(int) # connection progress percentage (0-100)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._mac: Optional[str] = None
+        self._client: Optional[object] = None
+        self._state_lock = threading.RLock()
+        self._session_generation = 0
+        self._write_lock: Optional[asyncio.Lock] = None
+        self._connect_future = None
+        self._disconnect_future = None
+        self._is_connecting = False
+        self._is_connected = False
+        self._error_notify_enabled = False
+        self._next_connect_timeout_s: Optional[float] = None  # one-shot connect timeout override
+        # Persistent asyncio loop running in a background thread
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._loop_thread: Optional[threading.Thread] = None
+        # Store last FSR values
+        self._curr_left_fsr_value: float = 0.25
+        self._curr_right_fsr_value: float = 0.25
+        
+        # Setup logging system
+        self._setup_logging()
+
+    def _setup_logging(self):
+        """Setup file-based logging system for debugging and error tracking."""
+        try:
+            # Create logs directory in Saved_Data folder
+            base_dir = os.path.dirname(os.path.dirname(__file__))  # Python_GUI folder
+            log_dir = os.path.join(base_dir, "Saved_Data", "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            
+            # Create logger with timestamp in filename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_file = os.path.join(log_dir, f"device_manager_{timestamp}.log")
+            
+            # Configure logger
+            self.logger = logging.getLogger(f"QtExoDeviceManager_{id(self)}")
+            self.logger.setLevel(logging.DEBUG)
+            
+            # Remove any existing handlers to avoid duplicates
+            self.logger.handlers.clear()
+            
+            # File handler with detailed formatting
+            # Create custom handler that flushes on ERROR/CRITICAL
+            class FlushingFileHandler(logging.FileHandler):
+                def emit(self, record):
+                    super().emit(record)
+                    if record.levelno >= logging.ERROR:
+                        self.flush()
+            
+            file_handler = FlushingFileHandler(log_file, encoding='utf-8')
+            file_handler.setLevel(logging.DEBUG)
+            formatter = logging.Formatter(
+                '%(asctime)s.%(msecs)03d | %(levelname)-8s | %(funcName)-25s | %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+            file_handler.setFormatter(formatter)
+            self.logger.addHandler(file_handler)
+            
+            # Also add console handler for development
+            console_handler = logging.StreamHandler()
+            console_handler.setLevel(logging.INFO)
+            console_handler.setFormatter(formatter)
+            self.logger.addHandler(console_handler)
+            
+            self.logger.info("=" * 80)
+            self.logger.info("QtExoDeviceManager initialized")
+            self.logger.info(f"Log file: {log_file}")
+            self.logger.info(f"Python version: {sys.version}")
+            self.logger.info(f"BLE Available: {BLE_AVAILABLE}")
+            self.logger.info("=" * 80)
+            
+            # Store log file path for retrieval
+            self._log_file_path = log_file
+            
+            # Install exception hook to catch ANY unhandled exception
+            self._install_exception_hooks()
+            
+        except Exception as ex:
+            # Fallback to basic logger if file creation fails
+            self.logger = logging.getLogger(f"QtExoDeviceManager_{id(self)}")
+            self.logger.setLevel(logging.INFO)
+            self._log_file_path = None
+            self.logger.warning("Could not setup file logging: %s", ex)
+    
+    def _install_exception_hooks(self):
+        """Install hooks to catch unhandled exceptions."""
+        # Store original exception hook
+        self._original_excepthook = sys.excepthook
+        
+        def custom_excepthook(exc_type, exc_value, exc_traceback):
+            """Log any unhandled exception before it crashes the app."""
+            if issubclass(exc_type, KeyboardInterrupt):
+                # Don't log keyboard interrupts
+                sys.__excepthook__(exc_type, exc_value, exc_traceback)
+                return
+            
+            self.logger.critical("=" * 80)
+            self.logger.critical("UNHANDLED EXCEPTION DETECTED!")
+            self.logger.critical("=" * 80)
+            self.logger.critical(f"Exception Type: {exc_type.__name__}")
+            self.logger.critical(f"Exception Value: {exc_value}")
+            self.logger.critical("Traceback:")
+            for line in traceback.format_tb(exc_traceback):
+                self.logger.critical(line.strip())
+            self.logger.critical("=" * 80)
+            
+            # Call original exception hook to maintain normal behavior
+            self._original_excepthook(exc_type, exc_value, exc_traceback)
+        
+        sys.excepthook = custom_excepthook
+        self.logger.info("Exception hooks installed - all unhandled exceptions will be logged")
+    
+    def get_log_file_path(self) -> str:
+        """Get the path to the current log file."""
+        return getattr(self, '_log_file_path', None) or "Log file not available"
+
+    # Public API
+
+    def _mark_disconnected(
+        self,
+        reason: str = "",
+        client=None,
+        generation: Optional[int] = None,
+    ) -> bool:
+        """Clear only the connection that actually generated the callback."""
+        with self._state_lock:
+            if client is not None and self._client is not client:
+                self.logger.debug("Ignoring disconnect callback from an old client")
+                return False
+            if generation is not None and self._session_generation != generation:
+                self.logger.debug(
+                    "Ignoring disconnect callback from session %s; current=%s",
+                    generation,
+                    self._session_generation,
+                )
+                return False
+
+            self._session_generation += 1
+            self._is_connected = False
+            self._is_connecting = False
+            self._error_notify_enabled = False
+            self._client = None
+
+        self.logger.warning(
+            "Device disconnected. Reason: %s",
+            reason or "unknown",
+        )
+        self.log.emit(f"Disconnected ({reason})" if reason else "Disconnected")
+        self.disconnected.emit()
+        self.logger.info("Disconnected signal emitted to UI")
+        return True
+
+    def _capture_session(self):
+        """Return an immutable client/generation pair for one BLE operation."""
+        with self._state_lock:
+            client = self._client
+            generation = self._session_generation
+            if not (
+                client
+                and self._is_connected
+                and getattr(client, "is_connected", False)
+            ):
+                return None
+            return client, generation
+
+    def _is_current_session(self, client, generation: int) -> bool:
+        with self._state_lock:
+            return (
+                self._client is client
+                and self._session_generation == generation
+                and self._is_connected
+                and getattr(client, "is_connected", False)
+            )
+
+    async def _write_sequence(self, client, generation: int, steps) -> bool:
+        """Write one complete protocol transaction without interleaving."""
+        if self._write_lock is None:
+            self._write_lock = asyncio.Lock()
+
+        async with self._write_lock:
+            for payload, response, delay_after_s in steps:
+                if not self._is_current_session(client, generation):
+                    self.logger.info(
+                        "Discarding write from stale BLE session %s",
+                        generation,
+                    )
+                    return False
+
+                await client.write_gatt_char(
+                    UART_TX_UUID,
+                    payload,
+                    response=response,
+                )
+                if delay_after_s > 0:
+                    await asyncio.sleep(delay_after_s)
+            return True
+
+    async def _close_client_transport(
+        self,
+        client,
+        error_notify_enabled: bool,
+    ) -> bool:
+        """Close one Bleak client after its logical session is invalidated."""
+        try:
+            try:
+                await client.stop_notify(UART_RX_UUID)
+            except Exception:
+                pass
+            if error_notify_enabled:
+                try:
+                    await client.stop_notify(ERROR_CHAR_UUID)
+                except Exception:
+                    pass
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            return True
+        finally:
+            self.logger.debug("BLE transport disconnect complete")
+
+    async def _disconnect_session(
+        self,
+        client,
+        generation: int,
+    ) -> bool:
+        """Disconnect one captured session without touching a newer client."""
+        with self._state_lock:
+            if (
+                self._client is not client
+                or self._session_generation != generation
+            ):
+                return False
+            self._session_generation += 1
+            self._client = None
+            self._is_connected = False
+            self._is_connecting = False
+            error_notify_enabled = self._error_notify_enabled
+            self._error_notify_enabled = False
+
+        return await self._close_client_transport(
+            client,
+            error_notify_enabled,
+        )
+
+    @QtCore.Slot(str)
+    def set_mac(self, mac: str):
+        self._mac = mac
+
+    @QtCore.Slot(float)
+    def set_next_connect_timeout(self, seconds: float):
+        """Set a one-shot connect timeout override for the next connect() call."""
+        try:
+            self._next_connect_timeout_s = max(0.1, float(seconds))
+        except Exception:
+            self._next_connect_timeout_s = None
+
+    @QtCore.Slot()
+    def scan(self):
+        if not BLE_AVAILABLE:
+            self.error.emit("Bleak not available. Install with: pip install bleak")
+            self.scanResults.emit([])
+            return
+        self._ensure_loop()
+
+        async def _run_scan():
+            results = {}
+            try:
+                self.scanProgress.emit(0)
+                self.log.emit("Scanning for devices…")
+                self.logger.debug("Starting BLE scan")
+                
+                # Simulate progress during scan with periodic updates
+                scan_duration = 3.0  # seconds
+                update_interval = 0.5  # update every 0.5 seconds
+                updates = int(scan_duration / update_interval)
+                
+                # Start the scan in background; request advertisements so we can
+                # filter devices by the OpenExo UART service UUID.
+                scan_task = asyncio.create_task(
+                    BleakScanner.discover(timeout=scan_duration, return_adv=True)
+                )
+                
+                # Update progress while scanning
+                for i in range(updates):
+                    if scan_task.done():
+                        break
+                    progress = int((i + 1) / updates * 90)  # Go up to 90%
+                    self.scanProgress.emit(progress)
+                    await asyncio.sleep(update_interval)
+                
+                # Wait for scan to complete; guard against WinRT hangs without surfacing a hard error.
+                try:
+                    devices_with_adv = await asyncio.wait_for(scan_task, timeout=scan_duration + 2.0)
+                except asyncio.TimeoutError:
+                    scan_task.cancel()
+                    devices_with_adv = {}
+                    self.logger.warning("BLE scan timed out; returning no devices")
+                    self.log.emit("Scan timed out. Try scanning again.")
+                self.scanProgress.emit(95)
+                
+                self.logger.debug("Scan found %d device(s)", len(devices_with_adv))
+                
+                # Filter and collect only OpenExo/Arduino devices.
+                for device, adv in devices_with_adv.values():
+                    try:
+                        if self._filter_exo(device, adv) and device.address not in results:
+                            results[device.address] = device.name or "Unknown"
+                            self.logger.debug("Found: %s (%s)", device.name, device.address)
+                    except Exception as ex:
+                        self.logger.warning("Error processing scanned device: %s", ex)
+
+                self.scanProgress.emit(100)
+                if not results:
+                    self.log.emit("No OpenExo devices found")
+                else:
+                    self.log.emit(f"Found {len(results)} OpenExo device(s)")
+            except TypeError:
+                # Backward-compatible fallback if bleak doesn't support return_adv.
+                self.logger.warning("Bleak discover(return_adv=True) unsupported; using name fallback filter")
+                self.scanProgress.emit(0)
+                devices = await BleakScanner.discover(timeout=3.0)
+                for device in devices:
+                    name = (device.name or "").strip()
+                    # Arduino firmware advertises as EXOBLE_<suffix>.
+                    if name.upper().startswith("EXOBLE_") and device.address not in results:
+                        results[device.address] = name
+                        self.logger.debug("Found by name fallback: %s (%s)", name, device.address)
+                self.scanProgress.emit(100)
+                if not results:
+                    self.log.emit("No OpenExo devices found")
+                else:
+                    self.log.emit(f"Found {len(results)} OpenExo device(s)")
+                    
+            except Exception as ex:
+                self.error.emit(f"Scan error: {ex}")
+                self.logger.exception("Scan error")
+                self.scanProgress.emit(0)  # Reset on error
+            finally:
+                # Convert to list format: [(name, address), ...]
+                lst = [(name, addr) for addr, name in results.items()]
+                self.scanResults.emit(lst)
+
+        asyncio.run_coroutine_threadsafe(_run_scan(), self._loop)
+
+    @QtCore.Slot()
+    def connect(self):
+        self.logger.info(f"connect() called - MAC: {self._mac}")
+        
+        if not BLE_AVAILABLE:
+            self.logger.error("BLE not available - Bleak not installed")
+            self.error.emit("Bleak not available. Install with: pip install bleak")
+            return
+        if not self._mac:
+            self.logger.error("Connect failed - no MAC address set")
+            self.error.emit("No MAC address set")
+            return
+        # If our flags say "connected" but the underlying client isn't, recover.
+        if self._client and self._is_connected and not getattr(self._client, "is_connected", False):
+            self.logger.warning("Stale client detected - marking as disconnected")
+            self._mark_disconnected(
+                "stale client",
+                self._client,
+                self._session_generation,
+            )
+
+        with self._state_lock:
+            if self._is_connecting or self._is_connected:
+                self.logger.warning(
+                    "Already connecting or connected - ignoring connect request"
+                )
+                return
+            self._session_generation += 1
+            attempt_generation = self._session_generation
+            self._is_connecting = True
+
+        one_shot_timeout = self._next_connect_timeout_s
+        self._next_connect_timeout_s = None
+        connect_timeout_s = one_shot_timeout if one_shot_timeout is not None else 40.0
+        self.logger.info("Connect requested -> mac=%s", self._mac)
+        self.log.emit(f"Connecting to {self._mac}…")
+        self.logger.info("Ensuring event loop is running")
+        self._ensure_loop()
+
+        async def _run_connect():
+            pending_disconnect = self._disconnect_future
+            if pending_disconnect and not pending_disconnect.done():
+                try:
+                    await asyncio.wrap_future(pending_disconnect)
+                except Exception:
+                    pass
+
+            async def _connect_target(target, name_hint: str = "", address_hint: str = "") -> bool:
+                """Connect to a known Bleak target (device object or MAC string)."""
+                self.connectScanProgress.emit(-1)  # hide scan bar while connecting
+                self.connectionProgress.emit(20)
+                self.log.emit("Connecting to device…")
+                self.logger.info("Connecting to %s %s", name_hint, address_hint or str(target))
+
+                def _disc_cb(disconnected_client):
+                    try:
+                        self._mark_disconnected(
+                            "link lost",
+                            disconnected_client,
+                            attempt_generation,
+                        )
+                    except Exception:
+                        pass
+
+                client = BleakClient(target, disconnected_callback=_disc_cb)
+                try:
+                    ok = await client.connect()
+
+                    self.connectionProgress.emit(50)
+                    self.logger.debug(
+                        "connect() returned=%s, is_connected=%s",
+                        ok,
+                        getattr(client, "is_connected", False),
+                    )
+                    if not getattr(client, "is_connected", False):
+                        self.connectionProgress.emit(0)
+                        try:
+                            await client.disconnect()
+                        except Exception:
+                            pass
+                        return False
+
+                    with self._state_lock:
+                        attempt_is_current = (
+                            self._session_generation == attempt_generation
+                            and self._is_connecting
+                        )
+                    if not attempt_is_current:
+                        await client.disconnect()
+                        return False
+
+                    # Register the live client before notifications can deliver handshake bytes.
+                    with self._state_lock:
+                        self._client = client
+                        self._is_connected = True
+
+                    # Touch services to populate cache
+                    self.connectionProgress.emit(65)
+                    _ = client.services
+
+                    def _on_rx(sender, data: bytearray):
+                        try:
+                            if self._is_current_session(
+                                client,
+                                attempt_generation,
+                            ):
+                                self.dataReceived.emit(bytes(data))
+                        except Exception:
+                            pass
+
+                    def _on_error(sender, data: bytearray):
+                        try:
+                            if not self._is_current_session(
+                                client,
+                                attempt_generation,
+                            ):
+                                return
+                            msg = bytes(data).decode("utf-8", errors="ignore").strip("\x00").strip()
+                            if msg:
+                                self.deviceErrorReceived.emit(msg)
+                        except Exception:
+                            pass
+
+                    self.connectionProgress.emit(75)
+                    self.log.emit("Starting notifications…")
+                    await client.start_notify(UART_RX_UUID, _on_rx)
+                    self._error_notify_enabled = False
+                    try:
+                        await client.start_notify(ERROR_CHAR_UUID, _on_error)
+                        self._error_notify_enabled = True
+                    except Exception as ex:
+                        self.log.emit("Error characteristic not found; continuing with UART only.")
+                        self.logger.warning("Error characteristic notify failed: %s", ex)
+
+                    connected_name = (name_hint or "").strip() or "Unknown"
+                    connected_address = address_hint or getattr(client, "address", "") or self._mac
+                    self.connectionProgress.emit(90)
+                    self.logger.info("Successfully connected to %s (%s)", connected_name, connected_address)
+                    self.connected.emit(connected_name, connected_address)
+                    self.connectionProgress.emit(100)
+                    self.log.emit("Connected and notifications started")
+                    self.logger.info("Connected; UART notifications started")
+                    return True
+                except asyncio.CancelledError:
+                    self.logger.warning("Connect attempt cancelled for %s", address_hint or str(target))
+                    self.connectionProgress.emit(0)
+                    with self._state_lock:
+                        if (
+                            self._client is client
+                            and self._session_generation == attempt_generation
+                        ):
+                            self._client = None
+                            self._is_connected = False
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                    raise
+                except Exception as conn_ex:
+                    self.logger.warning("Connect attempt failed for %s: %s", address_hint or str(target), conn_ex)
+                    self.connectionProgress.emit(0)
+                    with self._state_lock:
+                        if (
+                            self._client is client
+                            and self._session_generation == attempt_generation
+                        ):
+                            self._client = None
+                            self._is_connected = False
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                    return False
+
+            try:
+                self.connectScanProgress.emit(0)
+                self.connectionProgress.emit(0)
+
+                def _filter_requested_exo(device, adv) -> bool:
+                    if not self._filter_exo(device, adv):
+                        return False
+                    if not self._mac:
+                        return True
+                    return (device.address or "").lower() == self._mac.lower()
+
+                scan_timeout_s = connect_timeout_s if one_shot_timeout is not None else 40.0
+
+                scan_first = one_shot_timeout is not None and sys.platform == "darwin"
+
+                # Fast path: if a saved MAC is known, try direct connect first.
+                # On macOS, CoreBluetooth/Bleak is more reliable when reconnecting
+                # from a freshly discovered BLEDevice than from the raw saved UUID.
+                if self._mac and not scan_first:
+                    self.log.emit("Trying saved device address…")
+                    direct_timeout_s = connect_timeout_s
+                    if one_shot_timeout is not None:
+                        direct_timeout_s = min(connect_timeout_s, 8.0)
+                    try:
+                        async with asyncio.timeout(direct_timeout_s):
+                            if await _connect_target(self._mac, name_hint="Saved device", address_hint=self._mac):
+                                return
+                    except asyncio.TimeoutError:
+                        self.logger.warning("Direct connect timed out after %.1f seconds", direct_timeout_s)
+                        self.log.emit("Direct reconnect timed out. Scanning for saved device…")
+
+                    self.log.emit("Direct connect failed. Falling back to scan…")
+                    self.connectionProgress.emit(0)
+                    self.connectScanProgress.emit(0)
+                elif self._mac:
+                    self.log.emit("Scanning for saved device…")
+
+                # Wrap scan fallback in a bounded timeout.
+                async with asyncio.timeout(scan_timeout_s):
+                    attempts = 4 if one_shot_timeout is None else max(1, int(scan_timeout_s // 3))
+                    for attempt in range(attempts):
+                        # Scanning phase progress is spread across all attempts.
+                        scan_base = int((attempt / attempts) * 100)
+                        scan_span = int(100 / attempts)
+                        self.connectScanProgress.emit(scan_base)
+                        
+                        self.log.emit(f"Attempt {attempt+1} of {attempts}")
+                        self.log.emit("Scanning for device…")
+                        
+                        device = None
+                        try:
+                            # Each scan attempt has 3 second timeout with progress updates
+                            scan_duration = 3.0
+                            scan_start = asyncio.get_event_loop().time()
+                            
+                            # Start scanning in background
+                            scan_task = asyncio.create_task(
+                                BleakScanner.find_device_by_filter(_filter_requested_exo, timeout=scan_duration)
+                            )
+                            
+                            # Update progress while scanning
+                            while not scan_task.done():
+                                elapsed = asyncio.get_event_loop().time() - scan_start
+                                scan_progress = min(elapsed / scan_duration, 1.0)
+                                # Map to current attempt's progress range.
+                                progress = scan_base + int(scan_progress * scan_span)
+                                self.connectScanProgress.emit(progress)
+                                await asyncio.sleep(0.2)  # Update every 200ms
+                            
+                            device = await scan_task
+                        except Exception as se:
+                            self.logger.warning("find_device_by_filter error: %s", se)
+
+                        if device:
+                            # Device found - hide scanning bar, start connection bar
+                            self.connectScanProgress.emit(100)  # Complete scanning
+                            self.log.emit(f"Found: {device.name} - {device.address}")
+                            # If a specific MAC was requested, ensure match
+                            if self._mac and device.address != self._mac:
+                                self.log.emit("Found device does not match the specified address.")
+                                device = None
+                            else:
+                                if await _connect_target(
+                                    device,
+                                    name_hint=device.name or "",
+                                    address_hint=device.address,
+                                ):
+                                    return
+                                # WinRT can be flaky; retry with the next scan attempt.
+                                self.connectScanProgress.emit(scan_base)
+                                await asyncio.sleep(1.0)
+                        else:
+                            self.log.emit("No device found.")
+
+                    # If we exit loop without returning
+                    self.logger.error("Connection failed - max attempts reached")
+                    if one_shot_timeout is not None:
+                        self.error.emit("Could not connect to saved device.")
+                    else:
+                        self.error.emit("Max attempts reached. Could not connect.")
+            except asyncio.TimeoutError:
+                self.logger.error("Connection timeout after %.0f seconds", scan_timeout_s)
+                self.connectionProgress.emit(0)
+                self.error.emit(f"Connection timeout after {scan_timeout_s:.0f} seconds")
+            except Exception as ex:
+                self.logger.exception(f"Connection error: {ex}")
+                self.connectionProgress.emit(0)
+                self.error.emit(str(ex))
+            finally:
+                with self._state_lock:
+                    if self._session_generation == attempt_generation:
+                        self._is_connecting = False
+                self.logger.info("Connection attempt completed")
+
+        future = asyncio.run_coroutine_threadsafe(_run_connect(), self._loop)
+        self._connect_future = future
+
+        def _clear_connect_future(done_future):
+            if self._connect_future is done_future:
+                self._connect_future = None
+
+        future.add_done_callback(_clear_connect_future)
+
+
+    @QtCore.Slot()
+    def disconnect(self):
+        """Disconnect the current session without affecting a later reconnect."""
+        self.logger.info("disconnect() called - intentional disconnect")
+
+        with self._state_lock:
+            client = self._client
+            generation = self._session_generation
+            connect_future = self._connect_future
+            error_notify_enabled = self._error_notify_enabled
+
+            if client is None:
+                # A connect attempt can be invalidated before it owns a client.
+                if self._is_connecting:
+                    self._session_generation += 1
+                    self._is_connecting = False
+                else:
+                    self.logger.warning(
+                        "disconnect() called but no client exists"
+                    )
+            else:
+                self._session_generation += 1
+                self._client = None
+                self._is_connected = False
+                self._is_connecting = False
+                self._error_notify_enabled = False
+
+        if connect_future and not connect_future.done():
+            connect_future.cancel()
+
+        if client is None or not self._loop:
+            return
+
+        future = asyncio.run_coroutine_threadsafe(
+            self._close_client_transport(client, error_notify_enabled),
+            self._loop,
+        )
+        self._disconnect_future = future
+
+        def _clear_disconnect_future(done_future):
+            if self._disconnect_future is done_future:
+                self._disconnect_future = None
+
+        future.add_done_callback(_clear_disconnect_future)
+
+    @QtCore.Slot(bytes)
+    def write(self, payload: bytes):
+        session = self._capture_session()
+        if session is None or not self._loop:
+            # Silently fail if not connected (avoids errors during disconnect)
+            self.logger.debug(f"Write aborted - no client or loop. Payload: {payload}")
+            return
+        client, generation = session
+
+        async def _run_write():
+            try:
+                self.logger.debug(f"Writing to UART: {payload}")
+                if await self._write_sequence(
+                    client,
+                    generation,
+                    [(bytes(payload), False, 0.0)],
+                ):
+                    self.logger.debug(f"Write successful: {payload}")
+            except Exception as ex:
+                self.logger.exception(f"Write failed for payload {payload}: {ex}")
+                # Only emit error if we're still supposed to be connected
+                if self._is_connected:
+                    self.error.emit(str(ex))
+
+        asyncio.run_coroutine_threadsafe(_run_write(), self._loop)
+
+    def _queue_write_steps(
+        self,
+        steps,
+        success_message: Optional[str] = None,
+        initial_delay_s: float = 0.0,
+    ):
+        """Submit one session-bound, serialized BLE transaction."""
+        session = self._capture_session()
+        if session is None:
+            self.error.emit("Not connected")
+            return None
+        client, generation = session
+        frozen_steps = tuple(
+            (bytes(payload), bool(response), float(delay_after_s))
+            for payload, response, delay_after_s in steps
+        )
+
+        async def _do():
+            try:
+                if initial_delay_s > 0:
+                    await asyncio.sleep(initial_delay_s)
+                completed = await self._write_sequence(
+                    client,
+                    generation,
+                    frozen_steps,
+                )
+                if completed and success_message:
+                    self.log.emit(success_message)
+                return completed
+            except Exception as ex:
+                self.logger.exception(
+                    "BLE transaction failed for session %s: %s",
+                    generation,
+                    ex,
+                )
+                if self._is_current_session(client, generation):
+                    self.error.emit(str(ex))
+                return False
+
+        return self._submit(_do())
+
+    # ----- Command helpers and API parity with legacy ExoDeviceManager -----
+    def _ensure_connected(self) -> bool:
+        self.logger.debug(f"Checking connection: client={self._client is not None}, loop={self._loop is not None}, connected={self._is_connected}")
+        
+        if not (self._client and self._loop and self._is_connected):
+            self.logger.error("Connection check failed: missing client, loop, or not marked as connected")
+            self.error.emit("Not connected")
+            return False
+
+        # Check if the asyncio loop thread is still alive
+        if not (self._loop_thread and self._loop_thread.is_alive()):
+            self.logger.critical("Event loop thread is dead!")
+            self._mark_disconnected(
+                "event loop died",
+                self._client,
+                self._session_generation,
+            )
+            self.error.emit("Not connected - event loop stopped")
+            return False
+
+        # If the OS link dropped, BleakClient.is_connected will be False.
+        if not getattr(self._client, "is_connected", False):
+            self.logger.warning("BleakClient reports not connected (stale client)")
+            self._mark_disconnected(
+                "stale client",
+                self._client,
+                self._session_generation,
+            )
+            self.error.emit("Not connected")
+            return False
+
+        self.logger.debug("Connection check passed")
+        return True
+
+    def _submit(self, coro):
+        """Submit coroutine to event loop with error handling and logging."""
+        try:
+            if not self._loop:
+                self.logger.critical("Cannot submit coroutine: event loop is None!")
+                self.error.emit("Internal error: event loop not initialized")
+                return None
+            
+            if not self._loop_thread or not self._loop_thread.is_alive():
+                self.logger.critical("Cannot submit coroutine: event loop thread is not alive!")
+                self.error.emit("Internal error: event loop thread stopped")
+                return None
+            
+            self.logger.debug(f"Submitting coroutine: {coro.__name__ if hasattr(coro, '__name__') else str(coro)}")
+            future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+            
+            # Add callback to log any exceptions from the coroutine
+            def _log_exception(fut):
+                try:
+                    # This will raise if the coroutine had an exception
+                    fut.result()
+                except Exception as ex:
+                    # Only log if the exception wasn't already handled
+                    self.logger.error(f"Unhandled exception in coroutine: {ex}", exc_info=True)
+            
+            future.add_done_callback(_log_exception)
+            return future
+        except Exception as ex:
+            self.logger.exception(f"Error submitting coroutine: {ex}")
+            self.error.emit(f"Internal error: {ex}")
+            return None
+
+    @staticmethod
+    def build_parameter_updates(parameter_list: list) -> list[tuple[int, int, int, float]]:
+        if len(parameter_list) != 5:
+            raise ValueError("Parameter update must contain bilateral, joint, controller, parameter, value")
+
+        use_bilateral = bool(parameter_list[0])
+        joint_id = int(parameter_list[1])
+        controller_id = int(parameter_list[2])
+        parameter_index = int(parameter_list[3])
+        value = float(parameter_list[4])
+
+        for label, field in (
+            ("joint", joint_id),
+            ("controller", controller_id),
+            ("parameter", parameter_index),
+        ):
+            if field < 0 or field > 255:
+                raise ValueError(f"{label} field out of range: {field}")
+
+        side_mask = 0x60
+        left_side = 0x40
+        right_side = 0x20
+        side_bits = joint_id & side_mask
+        if side_bits not in (left_side, right_side):
+            raise ValueError(f"Joint ID {joint_id} does not include a valid side bit")
+
+        updates = [(joint_id, controller_id, parameter_index, value)]
+        if use_bilateral:
+            mirror_joint_id = joint_id ^ side_mask
+            mirror_side_bits = mirror_joint_id & side_mask
+            if mirror_side_bits not in (left_side, right_side):
+                raise ValueError(f"Could not mirror joint ID {joint_id} across sides")
+            updates.append((mirror_joint_id, controller_id, parameter_index, value))
+
+        return updates
+
+    @QtCore.Slot()
+    def startExoMotors(self):
+        if not self._ensure_connected():
+            return
+        self._queue_write_steps(
+            [(b"E", False, 0.0)],
+            "Start motors command sent",
+            initial_delay_s=1.0,
+        )
+
+    @QtCore.Slot()
+    def calibrateTorque(self):
+        self.logger.info("calibrateTorque() called")
+        
+        if not self._ensure_connected():
+            self.logger.warning("calibrateTorque() aborted - not connected")
+            return
+
+        self.logger.info("Sending torque calibration command 'H'")
+        self._queue_write_steps(
+            [(b"H", False, 0.0)],
+            "Calibrate torque command sent",
+        )
+
+    @QtCore.Slot()
+    def calibrateFSRs(self):
+        self.logger.info("calibrateFSRs() called")
+        
+        if not self._ensure_connected():
+            self.logger.warning("calibrateFSRs() aborted - not connected")
+            return
+
+        self.logger.info("Sending FSR calibration command 'L'")
+        self._queue_write_steps(
+            [(b"L", False, 0.0)],
+            "Calibrate FSRs command sent",
+        )
+
+    @QtCore.Slot()
+    def motorOff(self):
+        if not self._ensure_connected():
+            return
+
+        self._queue_write_steps(
+            [(b"w", True, 0.0)],
+            "Motor OFF command sent",
+        )
+
+    @QtCore.Slot()
+    def motorOn(self):
+        if not self._ensure_connected():
+            return
+
+        self._queue_write_steps(
+            [(b"x", True, 0.0)],
+            "Motor ON command sent",
+        )
+
+    @QtCore.Slot(list)
+    def updateTorqueValues(self, parameter_list: list):
+        if not self._ensure_connected():
+            return
+
+        try:
+            updates = self.build_parameter_updates(parameter_list)
+        except Exception as ex:
+            self.logger.warning("Invalid parameter update payload %s: %s", parameter_list, ex)
+            self.error.emit(str(ex))
+            return
+
+        steps = []
+        for joint_id, controller_id, parameter_index, value in updates:
+            self.logger.info(
+                "Queueing parameter update: joint=%s controller=%s index=%s value=%s",
+                joint_id,
+                controller_id,
+                parameter_index,
+                value,
+            )
+            steps.append((b"f", False, 0.0))
+            values = (joint_id, controller_id, parameter_index, value)
+            for value_index, val in enumerate(values):
+                delay_after = 0.01 if value_index == len(values) - 1 else 0.0
+                steps.append(
+                    (struct.pack("<d", float(val)), False, delay_after)
+                )
+
+        self._queue_write_steps(steps, "Torque parameters updated")
+
+    @QtCore.Slot(float, float)
+    def sendFsrValues(self, left_fsr: float, right_fsr: float):
+        if not self._ensure_connected():
+            return
+
+        self._curr_left_fsr_value = float(left_fsr)
+        self._curr_right_fsr_value = float(right_fsr)
+        self._queue_write_steps(
+            [
+                (b"R", False, 0.0),
+                (
+                    struct.pack("<d", self._curr_left_fsr_value),
+                    False,
+                    0.0,
+                ),
+                (
+                    struct.pack("<d", self._curr_right_fsr_value),
+                    False,
+                    0.0,
+                ),
+            ],
+            "FSR values sent",
+        )
+
+    @QtCore.Slot()
+    def sendPresetFsrValues(self):
+        if not self._ensure_connected():
+            return
+
+        self._queue_write_steps(
+            [
+                (b"R", False, 0.0),
+                (
+                    struct.pack("<d", self._curr_left_fsr_value),
+                    False,
+                    0.0,
+                ),
+                (
+                    struct.pack("<d", self._curr_right_fsr_value),
+                    False,
+                    0.0,
+                ),
+            ],
+            "Preset FSR values sent",
+        )
+
+    @QtCore.Slot()
+    def stopTrial(self):
+        if not self._ensure_connected():
+            return
+
+        self._queue_write_steps(
+            [(b"G", False, 0.0)],
+            "Stop trial command sent",
+        )
+
+    @QtCore.Slot()
+    def endTrialAndDisconnect(self):
+        """Send G -> w -> Z as one confirmed sequence, then disconnect."""
+        if not self._ensure_connected():
+            return
+        session = self._capture_session()
+        if session is None:
+            self.error.emit("Not connected")
+            return
+        client, generation = session
+
+        async def _do():
+            try:
+                completed = await self._write_sequence(
+                    client,
+                    generation,
+                    (
+                        (b"G", True, 0.0),
+                        (b"w", True, 0.0),
+                        (b"Z", True, 0.25),
+                    ),
+                )
+                if not completed:
+                    return False
+                disconnected = await self._disconnect_session(
+                    client,
+                    generation,
+                )
+                if disconnected:
+                    self.log.emit(
+                        "Stop trial, motor OFF, and reset commands sent"
+                    )
+                return disconnected
+            except Exception as ex:
+                self.logger.exception(
+                    "End-trial shutdown failed for session %s: %s",
+                    generation,
+                    ex,
+                )
+                if self._is_current_session(client, generation):
+                    self.error.emit(str(ex))
+                return False
+
+        future = self._submit(_do())
+        self._disconnect_future = future
+        if future is not None:
+            def _clear_shutdown_future(done_future):
+                if self._disconnect_future is done_future:
+                    self._disconnect_future = None
+
+            future.add_done_callback(_clear_shutdown_future)
+
+    @QtCore.Slot()
+    def switchToAssist(self):
+        if not self._ensure_connected():
+            return
+
+        self._queue_write_steps(
+            [(b"c", False, 0.0)],
+            "Assist mode command sent",
+        )
+
+    @QtCore.Slot()
+    def switchToResist(self):
+        if not self._ensure_connected():
+            return
+
+        self._queue_write_steps(
+            [(b"S", False, 0.0)],
+            "Resist mode command sent",
+        )
+
+    @QtCore.Slot(float)
+    def sendStiffness(self, stiffness: float):
+        if not self._ensure_connected():
+            return
+
+        self._queue_write_steps(
+            [
+                (b"A", False, 0.0),
+                (struct.pack("<d", float(stiffness)), False, 0.0),
+            ],
+            f"Stiffness sent: {stiffness}",
+        )
+
+    @QtCore.Slot(object)
+    def newStiffness(self, stiffnessInput):
+        try:
+            val = float(stiffnessInput)
+        except Exception:
+            self.error.emit("Invalid stiffness value")
+            return
+        self.sendStiffness(val)
+
+    @QtCore.Slot()
+    def play(self):
+        if not self._ensure_connected():
+            return
+
+        self._queue_write_steps(
+            [(b"X", True, 0.0)],
+            "Play command sent",
+        )
+
+    @QtCore.Slot()
+    def send_acknowledgement(self):
+        if not self._ensure_connected():
+            return
+
+        self._queue_write_steps(
+            [(b"$", False, 0.0)],
+            "Ack sent",
+        )
+
+    @QtCore.Slot()
+    def beginTrial(self):
+        """Mirror legacy beginTrial: start motors, calibrate torque, calibrate FSRs, send preset FSR values."""
+        self.logger.info("beginTrial() called - starting trial sequence")
+        
+        if not self._ensure_connected():
+            self.logger.warning("beginTrial() aborted - not connected")
+            return
+
+        self._queue_write_steps(
+            [
+                (b"E", False, 0.0),
+                (b"L", False, 0.0),
+                (b"R", False, 0.0),
+                (
+                    struct.pack("<d", self._curr_left_fsr_value),
+                    False,
+                    0.0,
+                ),
+                (
+                    struct.pack("<d", self._curr_right_fsr_value),
+                    False,
+                    0.0,
+                ),
+            ],
+            "Begin trial sequence sent",
+            initial_delay_s=1.0,
+        )
+
+    def _ensure_loop(self):
+        if self._loop and self._loop_thread and self._loop_thread.is_alive():
+            self.logger.debug("Event loop already running")
+            return
+        
+        self.logger.info("Creating new event loop thread")
+        self._loop = asyncio.new_event_loop()
+        self._write_lock = None
+
+        def _runner():
+            try:
+                asyncio.set_event_loop(self._loop)
+                self.logger.info("Event loop thread started")
+                
+                # Set exception handler for the event loop to catch async exceptions
+                def _loop_exception_handler(loop, context):
+                    exception = context.get('exception')
+                    message = context.get('message', 'No message')
+                    self.logger.error("=" * 80)
+                    self.logger.error("ASYNC EXCEPTION IN EVENT LOOP")
+                    self.logger.error(f"Message: {message}")
+                    if exception:
+                        self.logger.error(f"Exception: {exception}", exc_info=exception)
+                    else:
+                        self.logger.error(f"Context: {context}")
+                    self.logger.error("=" * 80)
+                
+                self._loop.set_exception_handler(_loop_exception_handler)
+                
+                self._loop.run_forever()
+                self.logger.warning("Event loop stopped running")
+            except Exception as ex:
+                self.logger.critical(f"Event loop thread crashed: {ex}", exc_info=True)
+                self.logger.critical("=" * 80)
+
+        self._loop_thread = threading.Thread(target=_runner, daemon=True, name="BLE-EventLoop")
+        self._loop_thread.start()
+        self.logger.info(f"Event loop thread created (thread_id: {self._loop_thread.ident}, name: {self._loop_thread.name})")
+
+    # exoDeviceManager-style BLE filter (UART service UUID)
+    @staticmethod
+    def _filter_exo(device, adv) -> bool:
+        try:
+            uuids = set((adv.service_uuids or []))
+            return UART_SERVICE_UUID.lower() in {u.lower() for u in uuids}
+        except Exception:
+            return False
+
+    # Removed invalid get_char_handle; bleak accepts UUIDs directly

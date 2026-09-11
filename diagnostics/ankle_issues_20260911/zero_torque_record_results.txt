@@ -1,0 +1,54 @@
+After recalibration 15:18:58 to 15:19:18: 1891 rows
+  Desired Torque (L): unique=111, min=-12.85, max=0.0
+  Measured Torque (L): unique=683, min=-22.03, max=6.3
+  Desired Torque (R): unique=100, min=-7.51, max=0.0
+  Measured Torque (R): unique=654, min=-14.09, max=5.94
+  Toe FSR (L): unique=376, min=-5.76, max=14.0
+  Toe FSR (R): unique=375, min=-6.11, max=11.78
+  Exoskeleton time (seconds): unique=1313, min=297.82, max=317.83
+PJMC before switch 15:19:22 to 15:19:42: 1918 rows
+  Desired Torque (L): unique=160, min=-12.85, max=0.0
+  Measured Torque (L): unique=884, min=-26.73, max=5.05
+  Desired Torque (R): unique=163, min=-12.85, max=0.0
+  Measured Torque (R): unique=884, min=-25.43, max=5.46
+  Toe FSR (L): unique=127, min=-0.11, max=1.52
+  Toe FSR (R): unique=115, min=-0.1, max=1.36
+  Exoskeleton time (seconds): unique=1313, min=-327.67, max=327.67
+Zero Torque first 15:19:45 to 15:20:09: 2266 rows
+  Desired Torque (L): unique=1, min=0.0, max=0.0
+  Measured Torque (L): unique=1, min=-4.9, max=-4.9
+  Desired Torque (R): unique=1, min=0.0, max=0.0
+  Measured Torque (R): unique=1, min=-6.15, max=-6.15
+  Toe FSR (L): unique=81, min=-0.18, max=0.89
+  Toe FSR (R): unique=78, min=-0.12, max=0.91
+  Exoskeleton time (seconds): unique=1575, min=-310.57, max=-286.51
+PJMC restored first 15:20:12 to 15:20:32: 1932 rows
+  Desired Torque (L): unique=140, min=-12.85, max=0.0
+  Measured Torque (L): unique=702, min=-27.61, max=3.75
+  Desired Torque (R): unique=154, min=-12.85, max=0.0
+  Measured Torque (R): unique=737, min=-26.22, max=1.11
+  Toe FSR (L): unique=103, min=-0.1, max=1.36
+  Toe FSR (R): unique=96, min=-0.05, max=1.21
+  Exoskeleton time (seconds): unique=1310, min=-283.54, max=-263.54
+Zero Torque second 15:21:49 to 15:22:04: 1403 rows
+  Desired Torque (L): unique=1, min=0.0, max=0.0
+  Measured Torque (L): unique=1, min=1.19, max=1.19
+  Desired Torque (R): unique=1, min=0.0, max=0.0
+  Measured Torque (R): unique=1, min=-3.39, max=-3.39
+  Toe FSR (L): unique=100, min=-0.07, max=1.26
+  Toe FSR (R): unique=71, min=0.0, max=0.93
+  Exoskeleton time (seconds): unique=932, min=-186.57, max=-171.5
+PJMC restored second 15:22:07 to 15:22:27: 1940 rows
+  Desired Torque (L): unique=136, min=-12.18, max=0.0
+  Measured Torque (L): unique=733, min=-21.26, max=1.72
+  Desired Torque (R): unique=94, min=-5.86, max=0.0
+  Measured Torque (R): unique=507, min=-11.32, max=4.15
+  Toe FSR (L): unique=92, min=-0.07, max=1.14
+  Toe FSR (R): unique=59, min=-0.1, max=0.7
+  Exoskeleton time (seconds): unique=1237, min=-168.57, max=-148.58
+Unilateral Zero Torque trial_20260911_150523.csv 15:05:58 to 15:06:15: 1595 rows
+  Measured Torque (L): unique=1, min=-0.1, max=-0.1
+  Measured Torque (R): unique=96, min=-1.6, max=0.73
+Unilateral Zero Torque trial_20260911_150644.csv 15:07:29 to 15:07:55: 2445 rows
+  Measured Torque (L): unique=1, min=-0.05, max=-0.05
+  Measured Torque (R): unique=58, min=-0.25, max=0.7

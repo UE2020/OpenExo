@@ -1,0 +1,9 @@
+Calibration finished; status=4; telemetry=0
+Start trial status restores telemetry=1
+Gain boundary: measurement 3.49 -> command -10.47; measurement 3.51 -> command -21.06 Nm
+Same 0.1 Nm measurement change: dt=2000 us -> -25.5; dt=2210 us -> -24 Nm
+Use PID=0 with current zero setpoints -> command 0 Nm
+Dated backup: settled measurement 3.49 -> -1.745; 3.51 -> -1.755 Nm (no gain switch)
+Zero Torque: raw torque 2 -> -8 Nm, transmitted measured field remains -4.9 Nm; command=0
+PJMC with stance=0, swing=0, Use PID=0: zero command and live measured field in stance and swing
+All source-behavior reproductions passed. No hardware accessed.

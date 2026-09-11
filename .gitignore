@@ -1,0 +1,28 @@
+# other image files
+#.emf
+#.png
+ExoCode/src/.vscode/settings.json
+ExoCode/src/.vs
+.vscode
+.vs
+ExoCode/.vscode
+*/.vs
+Libraries/ArduinoBLE/extras/arduino-ble-parser.py
+
+# Local runtime data and generated files (kept on disk).
+__pycache__/
+*.py[cod]
+Python_GUI/Saved_Data/
+html/
+latex/
+Documentation/ReadTheDocs/source/_build/
+**/_Trashes_oldcopy/
+._*
+.DS_Store
+*.exe
+*.o
+*.obj
+*.hex
+*.elf
+*.map
+diagnostics/ankle_issues_20260911/source_reproduction.cpp
