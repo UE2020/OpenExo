@@ -315,13 +315,15 @@ float ZeroTorque::calc_motor_cmd()
     //Set feed-forward command to zero
     float cmd_ff = 0;
 
+    _controller_data->filtered_torque_reading = utils::ewma(_joint_data->torque_reading, _controller_data->filtered_torque_reading, 0.5f);
+
     //Set the motor command to the feed-forward command
     float cmd = cmd_ff;
     
     //Add the PID contribution to the motor command if desired 
     if (_controller_data->parameters[controller_defs::zero_torque::use_pid_idx])
     {
-        cmd = cmd_ff + _pid(cmd_ff, _joint_data->torque_reading, _controller_data->parameters[controller_defs::zero_torque::p_gain_idx], _controller_data->parameters[controller_defs::zero_torque::i_gain_idx], _controller_data->parameters[controller_defs::zero_torque::d_gain_idx]);
+        cmd = cmd_ff + _pid(cmd_ff, _controller_data->filtered_torque_reading, _controller_data->parameters[controller_defs::zero_torque::p_gain_idx], _controller_data->parameters[controller_defs::zero_torque::i_gain_idx], _controller_data->parameters[controller_defs::zero_torque::d_gain_idx]);
     }
 
     //Set the feed-forward setpoint to the feed-forward command

@@ -106,7 +106,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._t0 = None
         self._csv_path_last = None
         self._mark_counter = 0  # Trial mark counter
-        self._csv_preamble = ""  # Preamble for CSV filename
+        self._recording_number = 1
+        self._device_paused = False
         # Store controller -> params 2D matrix
         self._controller_matrix = []
         # Store controller values by (joint_id, controller_id)
@@ -116,13 +117,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # Device control wiring from ActiveTrialPage
         self.trial_page.deviceStartRequested.connect(self._on_device_start)
         self.trial_page.deviceStopRequested.connect(self._on_device_stop_motors)
-        self.trial_page.csvPreambleChanged.connect(self._on_csv_preamble_changed)
+        self.trial_page.startRecordingRequested.connect(self._on_start_recording)
+        self.trial_page.stopRecordingRequested.connect(self._on_stop_recording)
         self.trial_page.recalibrateFSRRequested.connect(self._on_recal_fsr)
         self.trial_page.sendPresetFSRRequested.connect(self._on_send_preset_fsr)
         self.trial_page.recalibrateTorqueRequested.connect(self._on_recal_torque)
         self.trial_page.markTrialRequested.connect(self._on_mark)
         self.trial_page.endTrialRequested.connect(self._on_end_trial)
-        self.trial_page.saveCsvRequested.connect(self._on_save_csv)
         self.trial_page.updateControllerRequested.connect(self._on_update_controller)
         self.trial_page.bioFeedbackRequested.connect(self._on_bio_feedback)
         self.trial_page.machineLearningRequested.connect(self._on_machine_learning)
@@ -166,13 +167,10 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             self.logger.error(f"Failed to reset monitoring: {e}")
             self.logger.debug(traceback.format_exc())
-        # Ensure CSV logging is started automatically with timestamped filename
-        try:
-            if self._csv_file is None:
-                self._start_csv_auto()
-        except Exception as e:
-            self.logger.error(f"Failed to start CSV logging: {e}")
-            self.logger.debug(traceback.format_exc())
+        self._device_paused = False
+        self._recording_number = 1
+        self.trial_page.set_next_recording_number(self._recording_number)
+        self.trial_page.set_recording_state(False)
         # Begin trial sequence (E -> L -> R + thresholds) to ensure FSRs stream
         try:
             self.qt_dev.beginTrial()
@@ -207,7 +205,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.logger.error(f"Failed to apply values to bio feedback page: {e}")
                 self.logger.debug(traceback.format_exc())
             # CSV logging
-            if self._csv_writer is not None:
+            if self._csv_writer is not None and not self._device_paused:
                 if not self._csv_header_written:
                     header = ["epoch", "mark"]
                     # Only include first 10 parameters (exclude battery and beyond)
@@ -513,7 +511,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # Resume motors (play functionality) - just turn motors back on
         try:
             self.logger.info("Turning motors ON")
+            self._device_paused = False
             self.qt_dev.motorOn()
+            if self._csv_file is not None:
+                self.trial_page.set_recording_state(True, "Recording")
         except Exception as e:
             self.logger.error(f"Failed to turn motors on: {e}")
             self.logger.debug(traceback.format_exc())
@@ -523,41 +524,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # Turn off motors (pause functionality)
         try:
             self.logger.info("Turning motors OFF")
+            self._device_paused = True
             self.qt_dev.motorOff()
+            if self._csv_file is not None:
+                self.trial_page.set_recording_state(True, "Recording paused with exo")
         except Exception as e:
             self.logger.error(f"Failed to turn motors off: {e}")
             self.logger.debug(traceback.format_exc())
-
-    @QtCore.Slot(str)
-    def _on_csv_preamble_changed(self, preamble: str):
-        """Update CSV filename preamble."""
-        self._csv_preamble = preamble
-        self.logger.info(f"CSV preamble set to: {preamble}")
-         # If we're currently logging, roll over immediately (no popup)
-        if self._csv_file is not None:
-            try:
-                self._csv_file.flush()
-                self._csv_file.close()
-            except Exception as e:
-                self.logger.error(f"Failed to close CSV file during preamble change: {e}")
-                self.logger.debug(traceback.format_exc())
-
-            # reset state (same reset you already do in _on_save_csv)
-            self._csv_file = None
-            self._csv_writer = None
-            self._csv_header_written = False
-            self._t0 = None
-            self._csv_path_last = None
-
-            # start a new CSV using the new prefix
-            self._start_csv_auto()
-
-            # optional: show a non-blocking confirmation somewhere
-            try:
-                self.trial_page.set_status_text(f"CSV prefix set. New file started: {self._csv_path_last}")
-            except Exception as e:
-                self.logger.error(f"Failed to update status text after preamble change: {e}")
-                self.logger.debug(traceback.format_exc())
 
     @QtCore.Slot()
     def _on_recal_fsr(self):
@@ -645,30 +618,12 @@ class MainWindow(QtWidgets.QMainWindow):
             # Navigate to scan page immediately
             self.stack.setCurrentWidget(self.scan_page)
             
-            # Stop CSV if running
-            if self._csv_file is not None:
-                try:
-                    self._csv_file.flush(); self._csv_file.close()
-                    self.logger.info(f"CSV file closed: {self._csv_path_last}")
-                except Exception as e:
-                    self.logger.error(f"Failed to close CSV file: {e}")
-                    self.logger.debug(traceback.format_exc())
-                self._csv_file = None
-                self._csv_writer = None
-                self._csv_header_written = False
-                self._t0 = None
-                self._mark_counter = 0  # Reset mark counter
-                try:
-                    if self._csv_path_last:
-                        self.scan_page.status.setText(f"Trial ended. CSV saved: {self._csv_path_last}")
-                except Exception as e:
-                    self.logger.error(f"Failed to update status text after trial end: {e}")
-                    self.logger.debug(traceback.format_exc())
-                try:
-                    self.trial_page.update_mark_count(0)
-                except Exception as e:
-                    self.logger.error(f"Failed to reset mark count: {e}")
-                    self.logger.debug(traceback.format_exc())
+            had_recording = self._csv_file is not None
+            saved_path = self._stop_recording()
+            if saved_path:
+                self.scan_page.status.setText(f"Trial ended. CSV saved: {saved_path}")
+            elif not had_recording:
+                self.scan_page.status.setText("Trial ended")
         except Exception as e:
             self.logger.error(f"Failed to end trial: {e}")
             self.logger.debug(traceback.format_exc())
@@ -683,30 +638,12 @@ class MainWindow(QtWidgets.QMainWindow):
             
             # Navigate to scan page immediately
             self.stack.setCurrentWidget(self.scan_page)
-            # Stop CSV if running
-            if self._csv_file is not None:
-                try:
-                    self._csv_file.flush(); self._csv_file.close()
-                    self.logger.info(f"CSV file closed on disconnect: {self._csv_path_last}")
-                except Exception as e:
-                    self.logger.error(f"Failed to close CSV on disconnect: {e}")
-                    self.logger.debug(traceback.format_exc())
-                self._csv_file = None
-                self._csv_writer = None
-                self._csv_header_written = False
-                self._t0 = None
-                self._mark_counter = 0  # Reset mark counter
-                try:
-                    if self._csv_path_last:
-                        self.scan_page.status.setText(f"Disconnected. CSV saved: {self._csv_path_last}")
-                except Exception as e:
-                    self.logger.error(f"Failed to update status on disconnect: {e}")
-                    self.logger.debug(traceback.format_exc())
-                try:
-                    self.trial_page.update_mark_count(0)
-                except Exception as e:
-                    self.logger.error(f"Failed to reset mark count on disconnect: {e}")
-                    self.logger.debug(traceback.format_exc())
+            had_recording = self._csv_file is not None
+            saved_path = self._stop_recording()
+            if saved_path:
+                self.scan_page.status.setText(f"Disconnected. CSV saved: {saved_path}")
+            elif not had_recording:
+                self.scan_page.status.setText("Disconnected")
         except Exception as e:
             self.logger.error(f"Failed to disconnect: {e}")
             self.logger.debug(traceback.format_exc())
@@ -720,52 +657,62 @@ class MainWindow(QtWidgets.QMainWindow):
             self.logger.debug(traceback.format_exc())
         self.stack.setCurrentWidget(self.scan_page)
 
+    @QtCore.Slot(str)
+    def _on_start_recording(self, name: str):
+        if self._csv_file is not None:
+            return
+        safe_name = "_".join(name.strip().split())
+        safe_name = "".join(c for c in safe_name if c.isalnum() or c in ("_", "-"))
+        if not safe_name:
+            safe_name = f"Trial_{self._recording_number}"
+        self._start_csv_auto(safe_name)
+
     @QtCore.Slot()
-    def _on_save_csv(self):
-        """Save current CSV file and immediately start a new one."""
+    def _on_stop_recording(self):
+        saved_path = self._stop_recording()
+        if saved_path:
+            self.trial_page.set_recording_state(
+                False, f"Saved: {os.path.basename(saved_path)}"
+            )
+            self._recording_number += 1
+            self.trial_page.set_next_recording_number(self._recording_number)
+
+    def _stop_recording(self):
+        if self._csv_file is None:
+            self.trial_page.set_recording_state(False)
+            return None
+        saved_path = self._csv_path_last
+        save_error = None
         try:
-            saved_path = None
-            # Close current CSV if open
-            if self._csv_file is not None:
-                self.logger.info("Saving current CSV and starting new one")
-                try:
-                    self._csv_file.flush()
-                    self._csv_file.close()
-                    saved_path = self._csv_path_last
-                    self.logger.info(f"CSV saved: {saved_path}")
-                except Exception as e:
-                    self.logger.error(f"Failed to save CSV: {e}")
-                    self.logger.debug(traceback.format_exc())
-                self._csv_file = None
-                self._csv_writer = None
-                self._csv_header_written = False
-                self._t0 = None
-                self._csv_path_last = None
-            
-            # Start a new CSV file immediately
-            self._start_csv_auto()
-            
-            # Show confirmation banner
-            try:
-                if saved_path:
-                    save_dir = os.path.dirname(saved_path)
-                    filename = os.path.basename(saved_path)
-                    msg = f"✓ CSV saved: {filename}\nDirectory: {save_dir}"
-                    self.scan_page.status.setText(msg)
-                    # Also show a message box for better visibility
-                    QtWidgets.QMessageBox.information(
-                        self,
-                        "CSV Saved",
-                        f"CSV file saved successfully:\n{filename}\n\nLocation: {save_dir}"
-                    )
-                else:
-                    self.scan_page.status.setText("New CSV logging started")
-            except Exception as e:
-                self.logger.error(f"Failed to show CSV save confirmation: {e}")
-                self.logger.debug(traceback.format_exc())
+            self._csv_file.flush()
         except Exception as e:
-            self.logger.error(f"Failed in _on_save_csv: {e}")
+            save_error = e
+            self.logger.error(f"Failed to flush CSV file: {e}")
             self.logger.debug(traceback.format_exc())
+        try:
+            self._csv_file.close()
+        except Exception as e:
+            save_error = save_error or e
+            self.logger.error(f"Failed to close CSV file: {e}")
+            self.logger.debug(traceback.format_exc())
+        if save_error is None:
+            self.logger.info(f"CSV saved: {saved_path}")
+        else:
+            saved_path = None
+        self._csv_file = None
+        self._csv_writer = None
+        self._csv_header_written = False
+        self._t0 = None
+        self._mark_counter = 0
+        self.trial_page.update_mark_count(0)
+        if saved_path:
+            self.trial_page.set_recording_state(False)
+            self.scan_page.status.setText(f"CSV saved: {saved_path}")
+        else:
+            message = "Recording could not be saved; check the log"
+            self.trial_page.set_recording_state(False, message)
+            self.scan_page.status.setText(message)
+        return saved_path
 
     @QtCore.Slot()
     def _on_update_controller(self):
@@ -937,13 +884,19 @@ class MainWindow(QtWidgets.QMainWindow):
             self.logger.error(f"Failed to sync settings page after connect: {e}")
             self.logger.debug(traceback.format_exc())
 
-    def _show_disconnect_warning(self):
+    def _show_disconnect_warning(self, had_recording: bool, saved_path):
         """Show disconnect warning dialog (called after disconnect handling completes)."""
         try:
+            if saved_path:
+                recording_message = f"The active recording was saved to:\n{saved_path}"
+            elif had_recording:
+                recording_message = "The active recording could not be saved. Check the log for details."
+            else:
+                recording_message = "No recording was active."
             QtWidgets.QMessageBox.warning(
                 self, 
                 "Device Disconnected", 
-                "The device has been unexpectedly disconnected.\n\nMotors have been turned off and the trial data has been saved."
+                f"The device has been unexpectedly disconnected.\n\n{recording_message}"
             )
         except Exception as e:
             self.logger.error(f"Failed to show disconnect warning: {e}")
@@ -970,67 +923,50 @@ class MainWindow(QtWidgets.QMainWindow):
             # Device is already disconnected, no need to send commands
             # (motorOff/stopTrial would fail with "Not connected" errors)
             self.logger.info("Device already disconnected - skipping motor off/stop trial commands")
-            # Show non-blocking notification of unexpected disconnect
-            # Use QTimer to defer the dialog so disconnect handling completes first
+            # Navigate back to the Scan page on unexpected disconnect
+            self.stack.setCurrentWidget(self.scan_page)
+
+            had_recording = self._csv_file is not None
+            saved_path = self._stop_recording()
+            if saved_path:
+                self.scan_page.status.setText(f"Unexpected disconnect. CSV saved: {saved_path}")
+            elif not had_recording:
+                self.scan_page.status.setText("Disconnected unexpectedly; no recording was active")
+            # Defer the dialog so disconnect handling completes first.
             try:
-                QtCore.QTimer.singleShot(100, lambda: self._show_disconnect_warning())
+                QtCore.QTimer.singleShot(
+                    100,
+                    lambda: self._show_disconnect_warning(had_recording, saved_path),
+                )
             except Exception as e:
                 self.logger.error(f"Failed to schedule disconnect warning dialog: {e}")
                 self.logger.debug(traceback.format_exc())
-            # Navigate back to the Scan page on unexpected disconnect
-            self.stack.setCurrentWidget(self.scan_page)
-            
-            # Ensure CSV is closed and announce saved path
-            if self._csv_file is not None:
-                try:
-                    self._csv_file.flush(); self._csv_file.close()
-                    self.logger.info(f"CSV closed after disconnect: {self._csv_path_last}")
-                except Exception as e:
-                    self.logger.error(f"Failed to close CSV after disconnect: {e}")
-                    self.logger.debug(traceback.format_exc())
-                self._csv_file = None
-                self._csv_writer = None
-                self._csv_header_written = False
-                self._t0 = None
-                self._mark_counter = 0  # Reset mark counter
-                try:
-                    if self._csv_path_last:
-                        self.scan_page.status.setText(f"Unexpected disconnect. CSV saved: {self._csv_path_last}")
-                except Exception as e:
-                    self.logger.error(f"Failed to update status after disconnect: {e}")
-                    self.logger.debug(traceback.format_exc())
-                try:
-                    self.trial_page.update_mark_count(0)
-                except Exception as e:
-                    self.logger.error(f"Failed to reset mark count after disconnect: {e}")
-                    self.logger.debug(traceback.format_exc())
         except Exception as e:
             self.logger.error(f"Failed to handle device disconnect: {e}")
             self.logger.debug(traceback.format_exc())
 
-    def _start_csv_auto(self):
-        # Save within Qt/Saved_Data
-        base_dir = os.path.dirname(__file__)  # Python_GUI/Qt
+    def _start_csv_auto(self, recording_name: str):
+        base_dir = os.path.dirname(__file__)
         save_dir = os.path.join(base_dir, "Saved_Data")
         try:
             os.makedirs(save_dir, exist_ok=True)
         except Exception as e:
             self.logger.error(f"Failed to create Saved_Data directory: {e}")
             self.logger.debug(traceback.format_exc())
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # Add preamble if set
-        if self._csv_preamble:
-            fname = os.path.join(save_dir, f"{self._csv_preamble}_trial_{ts}.csv")
-        else:
-            fname = os.path.join(save_dir, f"trial_{ts}.csv")
+            self.trial_page.set_recording_state(False, "Could not create the recording directory")
+            return
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        fname = os.path.join(save_dir, f"{recording_name}_{ts}.csv")
         try:
-            self._csv_file = open(fname, "w", newline="")
+            self._csv_file = open(fname, "x", newline="")
             self._csv_writer = csv.writer(self._csv_file)
             self._csv_header_written = False
             self._t0 = None
             self._mark_counter = 0  # Reset mark counter for new trial
             self._csv_path_last = fname
             self.logger.info(f"Started CSV logging to: {fname}")
+            status = "Recording paused with exo" if self._device_paused else "Recording"
+            self.trial_page.set_recording_state(True, status)
             try:
                 self.scan_page.status.setText(f"Logging to {fname}")
             except Exception as e:
@@ -1046,3 +982,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.logger.debug(traceback.format_exc())
             self._csv_file = None
             self._csv_writer = None
+            self._csv_path_last = None
+            message = "Recording could not be started; check the name and log"
+            self.trial_page.set_recording_state(False, message)
+            self.scan_page.status.setText(message)

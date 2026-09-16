@@ -25,7 +25,8 @@ class ActiveTrialPage(QtWidgets.QWidget):
 
     # Signals to be handled by MainWindow (placeholders can be wired later)
     endTrialRequested = QtCore.Signal()
-    saveCsvRequested = QtCore.Signal()
+    startRecordingRequested = QtCore.Signal(str)
+    stopRecordingRequested = QtCore.Signal()
     updateControllerRequested = QtCore.Signal()
     bioFeedbackRequested = QtCore.Signal()
     machineLearningRequested = QtCore.Signal()
@@ -35,7 +36,6 @@ class ActiveTrialPage(QtWidgets.QWidget):
     markTrialRequested = QtCore.Signal()
     deviceStartRequested = QtCore.Signal()
     deviceStopRequested = QtCore.Signal()
-    csvPreambleChanged = QtCore.Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -64,8 +64,8 @@ class ActiveTrialPage(QtWidgets.QWidget):
         new_btn_height = max(32, int(UIConfig.BTN_HEIGHT_SMALL * scale_factor))
 
         buttons = [
-            self.btn_toggle_points, self.btn_end_trial, self.btn_save_csv,
-            self.btn_set_preamble, self.btn_update_controller, self.btn_bio_feedback,
+            self.btn_toggle_points, self.btn_end_trial, self.btn_start_recording,
+            self.btn_stop_recording, self.btn_update_controller, self.btn_bio_feedback,
             self.btn_ml, self.btn_recal_fsr, self.btn_send_preset_fsr, self.btn_recal_torque,
             self.btn_mark, self.btn_pause_play,
         ]
@@ -164,10 +164,23 @@ class ActiveTrialPage(QtWidgets.QWidget):
         self.btn_update_controller.setEnabled(True)
         
         self.btn_mark = QtWidgets.QPushButton("Mark Trial (0)")
+        self.btn_mark.setEnabled(False)
         controls.addWidget(self.btn_mark)
         
-        self.btn_save_csv = QtWidgets.QPushButton("Save & New CSV")
-        controls.addWidget(self.btn_save_csv)
+        self.lbl_recording_status = QtWidgets.QLabel("Not recording")
+        self.lbl_recording_status.setWordWrap(True)
+        controls.addWidget(self.lbl_recording_status)
+
+        self.txt_recording_name = QtWidgets.QLineEdit("Trial 1")
+        self.txt_recording_name.setPlaceholderText("Recording name or number")
+        controls.addWidget(self.txt_recording_name)
+
+        self.btn_start_recording = QtWidgets.QPushButton("Start Recording")
+        controls.addWidget(self.btn_start_recording)
+
+        self.btn_stop_recording = QtWidgets.QPushButton("Stop & Save")
+        self.btn_stop_recording.setEnabled(False)
+        controls.addWidget(self.btn_stop_recording)
         
         # Separator
         controls.addSpacing(UIConfig.SPACING_XLARGE)
@@ -176,9 +189,6 @@ class ActiveTrialPage(QtWidgets.QWidget):
         # ═══════ SETTINGS ═══════
         controls.addWidget(create_section_label("Settings"))
         controls.addSpacing(UIConfig.SPACING_SMALL)
-        
-        self.btn_set_preamble = QtWidgets.QPushButton("Set CSV Prefix")
-        controls.addWidget(self.btn_set_preamble)
         
         self.btn_toggle_points = QtWidgets.QPushButton("Toggle Data Points")
         controls.addWidget(self.btn_toggle_points)
@@ -267,8 +277,13 @@ class ActiveTrialPage(QtWidgets.QWidget):
         self.btn_toggle_points.clicked.connect(self._toggle_points)
         # Emit-only wiring; MainWindow can connect these to actual actions
         self.btn_end_trial.clicked.connect(self.endTrialRequested.emit)
-        self.btn_save_csv.clicked.connect(self.saveCsvRequested.emit)
-        self.btn_set_preamble.clicked.connect(self._on_set_preamble_clicked)
+        self.btn_start_recording.clicked.connect(
+            lambda: self.startRecordingRequested.emit(self.txt_recording_name.text())
+        )
+        self.txt_recording_name.returnPressed.connect(
+            lambda: self.startRecordingRequested.emit(self.txt_recording_name.text())
+        )
+        self.btn_stop_recording.clicked.connect(self.stopRecordingRequested.emit)
         self.btn_update_controller.clicked.connect(self.updateControllerRequested.emit)
         self.btn_bio_feedback.clicked.connect(self.bioFeedbackRequested.emit)
         self.btn_ml.clicked.connect(self.machineLearningRequested.emit)
@@ -279,8 +294,8 @@ class ActiveTrialPage(QtWidgets.QWidget):
 
         # Apply consistent button styling
         buttons = [
-            self.btn_toggle_points, self.btn_end_trial, self.btn_save_csv,
-            self.btn_set_preamble, self.btn_update_controller, self.btn_bio_feedback,
+            self.btn_toggle_points, self.btn_end_trial, self.btn_start_recording,
+            self.btn_stop_recording, self.btn_update_controller, self.btn_bio_feedback,
             self.btn_ml, self.btn_recal_fsr, self.btn_send_preset_fsr, self.btn_recal_torque,
             self.btn_mark, self.btn_pause_play,
         ]
@@ -348,6 +363,17 @@ class ActiveTrialPage(QtWidgets.QWidget):
             self.btn_mark.setText(f"Mark Trial ({count})")
         except Exception:
             pass
+
+    def set_recording_state(self, recording: bool, message: str = ""):
+        """Update recording controls without affecting the connected exo session."""
+        self.btn_start_recording.setEnabled(not recording)
+        self.btn_stop_recording.setEnabled(recording)
+        self.btn_mark.setEnabled(recording)
+        self.txt_recording_name.setEnabled(not recording)
+        self.lbl_recording_status.setText(message or ("Recording" if recording else "Not recording"))
+
+    def set_next_recording_number(self, number: int):
+        self.txt_recording_name.setText(f"Trial {number}")
 
     def update_battery_level(self, voltage: float):
         """Update the battery level display."""
@@ -468,27 +494,8 @@ class ActiveTrialPage(QtWidgets.QWidget):
         else:
             # Play
             self.is_paused = False
-            self.btn_pause_play.setText("⏸ Pause")
+            self.btn_pause_play.setText("Pause")
             self.deviceStartRequested.emit()  # Start motors
-
-    def _on_set_preamble_clicked(self):
-        """Show dialog to set CSV filename preamble."""
-        text, ok = QtWidgets.QInputDialog.getText(
-            self,
-            "Set CSV Filename Prefix + Save new CSV",
-            "Enter prefix for CSV filenames (e.g., 'OutdoorShod'):",
-            QtWidgets.QLineEdit.Normal,
-            ""
-        )
-        if ok and text:
-            # Sanitize filename
-            text = "".join(c for c in text if c.isalnum() or c in ('_', '-'))
-            self.csvPreambleChanged.emit(text)
-            QtWidgets.QMessageBox.information(
-                self,
-                "CSV Prefix Set",
-                f"CSV files will be saved as:\n{text}_trial_YYYYMMDD_HHMMSS.csv"
-            )
 
     # Public API to integrate later with bridges
     def start_sim(self):
