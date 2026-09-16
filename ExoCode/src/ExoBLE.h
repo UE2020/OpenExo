@@ -63,8 +63,11 @@ class ExoBLE
          * @brief Send a BLE message using the Nordic UART Service. The data is serialized with the parser object. 
          * 
          * @param msg The message that you would like to send.
+         * @return true If the serialized message was handed to a subscribed peer.
+         * @return false If there was no connection, serialization failed, or no
+         *         peer was subscribed to notifications.
          */
-        void send_message(BleMessage &msg);
+        bool send_message(BleMessage &msg);
 
         /**
          * @brief Send an error code to the GUI, uses a seperate service and characteristic

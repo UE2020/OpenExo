@@ -379,6 +379,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 "value": value,
             }
             self._pending_param_updates.setdefault(key, []).append(record)
+            self.logger.debug(
+                "Awaiting ack token=%s: joint=%s controller=%s index=%s value=%s",
+                record["token"],
+                joint_id,
+                controller_id,
+                param_index,
+                value,
+            )
             QtCore.QTimer.singleShot(
                 10000,
                 lambda key=key, token=record["token"]: self._on_param_update_timeout(key, token),
@@ -463,6 +471,14 @@ class MainWindow(QtWidgets.QMainWindow):
             reason = int(ack.get("reason", 0))
             key = (joint_id, controller_id, param_index)
             record = self._pop_pending_param_update(key)
+            if record is None:
+                self.logger.warning(
+                    "Parameter update ack matched no pending request: joint=%s controller=%s index=%s accepted=%s",
+                    joint_id,
+                    controller_id,
+                    param_index,
+                    accepted,
+                )
 
             if accepted:
                 if record is not None:
@@ -504,7 +520,7 @@ class MainWindow(QtWidgets.QMainWindow):
             controller_id,
             param_index,
         )
-        self._show_param_update_status("Controller update failed: no device acknowledgement", warning=True)
+        self._show_param_update_status("Controller update unconfirmed: no device acknowledgement", warning=True)
 
     @QtCore.Slot()
     def _on_device_start(self):
@@ -759,19 +775,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self.logger.info(f"Applying settings: {payload}")
         try:
             updates = QtExoDeviceManager.build_parameter_updates(payload)
-            self._queue_pending_param_updates(updates)
-            self._show_param_update_status("", warning=False)
         except Exception as e:
             self.logger.error(f"Invalid parameter update request: {e}")
             self.logger.debug(traceback.format_exc())
             self._show_param_update_status(f"Controller update not sent: {e}", warning=True)
             return
 
+        # Submit first: only await acknowledgements for a request that was
+        # actually queued, otherwise a disconnected link looks like a device
+        # acknowledgement failure ten seconds later.
         try:
-            self.qt_dev.updateTorqueValues(payload)
+            submitted = self.qt_dev.updateTorqueValues(payload)
         except Exception as e:
             self.logger.error(f"Failed to update torque values: {e}")
             self.logger.debug(traceback.format_exc())
+            submitted = False
+
+        if submitted:
+            self._queue_pending_param_updates(updates)
+            self._show_param_update_status("", warning=False)
+        else:
+            self.logger.warning("Controller update was not submitted; no acknowledgement awaited")
+            self._show_param_update_status("Controller update not sent: device not connected", warning=True)
+
         # Return to trial page
         try:
             self.stack.setCurrentWidget(self.trial_page)

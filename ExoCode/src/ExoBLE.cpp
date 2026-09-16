@@ -338,11 +338,11 @@ bool ExoBLE::handle_updates()
     return ble_queue::size();
 }
 
-void ExoBLE::send_message(BleMessage &msg)
+bool ExoBLE::send_message(BleMessage &msg)
 {
     if (!this->_connected)
     {
-        return; /* Don't bother sending anything if no one is listening */
+        return false; /* Don't bother sending anything if no one is listening */
     }
 
     #if EXOBLE_DEBUG
@@ -354,10 +354,23 @@ void ExoBLE::send_message(BleMessage &msg)
         buffer,
         sizeof(buffer),
         msg);
-    if (bytes_to_send > 0)
+    if (bytes_to_send <= 0)
     {
-        _gatt_db.TXChar.writeValue(buffer, bytes_to_send);
+        logger::println("ExoBLE::send_message failed to serialize message", LogLevel::Warn);
+        return false;
     }
+
+    // The minimum ATT payload is MTU-3 = 20 bytes until the central negotiates
+    // a larger MTU, so longer frames are truncated on the wire. The host parser
+    // tolerates a frame whose trailing delimiter is dropped; report when the
+    // notification reaches no subscribed peer so lost ACKs are not silent.
+    const int delivered = _gatt_db.TXChar.writeValue(buffer, bytes_to_send);
+    if (delivered <= 0)
+    {
+        logger::println("ExoBLE::send_message notification not delivered", LogLevel::Warn);
+        return false;
+    }
+    return true;
 }
 
 void ExoBLE::send_error(int error_code, int joint_id)
