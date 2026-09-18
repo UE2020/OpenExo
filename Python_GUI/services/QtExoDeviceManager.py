@@ -962,16 +962,21 @@ class QtExoDeviceManager(QtCore.QObject):
         )
 
     @QtCore.Slot(list)
-    def updateTorqueValues(self, parameter_list: list):
+    def updateTorqueValues(self, parameter_list: list) -> bool:
+        """Queue a controller parameter update.
+
+        Returns True only when the request was actually queued for transmission,
+        so the caller can wait for an acknowledgement it may realistically get.
+        """
         if not self._ensure_connected():
-            return
+            return False
 
         try:
             updates = self.build_parameter_updates(parameter_list)
         except Exception as ex:
             self.logger.warning("Invalid parameter update payload %s: %s", parameter_list, ex)
             self.error.emit(str(ex))
-            return
+            return False
 
         steps = []
         for joint_id, controller_id, parameter_index, value in updates:
@@ -991,6 +996,7 @@ class QtExoDeviceManager(QtCore.QObject):
                 )
 
         self._queue_write_steps(steps, "Torque parameters updated")
+        return True
 
     @QtCore.Slot(float, float)
     def sendFsrValues(self, left_fsr: float, right_fsr: float):

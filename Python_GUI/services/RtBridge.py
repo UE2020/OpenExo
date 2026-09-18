@@ -56,6 +56,11 @@ class RtBridge(QtCore.QObject):
         self._payload: List[float] = []
         self._data_length = 0
 
+        # Byte-level reassembly for live protocol frames. BLE notifications can
+        # split a frame across callbacks or coalesce several frames into one, so
+        # frames must be parsed as a stream rather than per callback.
+        self._rx_buffer: bytes = b""
+
         # Handshake payload reassembly state
         self._collecting_handshake_payload = False
         
@@ -87,6 +92,14 @@ class RtBridge(QtCore.QObject):
         self._max_protocol_values = 32
         self._max_numeric_token_chars = 16
         self._max_metadata_items = 512
+        self._max_frame_buffer = 512
+        # ArduinoBLE truncates notifications to MTU-3 bytes, which drops the
+        # final delimiter from a 21-byte ACK. If a partial frame does not
+        # complete within this window, accept its last token as terminated.
+        self._frame_flush_ms = 100
+        self._frame_flush_timer = QtCore.QTimer()
+        self._frame_flush_timer.setSingleShot(True)
+        self._frame_flush_timer.timeout.connect(self._flush_partial_frame)
 
     @QtCore.Slot(bytes)
     def feed_bytes(self, data: bytes):
@@ -105,7 +118,35 @@ class RtBridge(QtCore.QObject):
             if stall_interval > 100:
                 self._stall_count += 1
         self._last_stall_time = current_time
-        
+
+        # Fresh bytes invalidate any pending idle-flush of a partial frame.
+        self._frame_flush_timer.stop()
+
+        self.logger.debug(
+            "RX callback: %d byte(s)%s: %r",
+            chunk_size,
+            f", {len(self._rx_buffer)} buffered" if self._rx_buffer else "",
+            bytes(data[:64]),
+        )
+
+        if self._is_metadata_phase():
+            self._feed_metadata_bytes(data)
+            return
+
+        self._rx_buffer += data
+        self._drain_frames()
+        if self._rx_buffer:
+            self._frame_flush_timer.start(self._frame_flush_ms)
+
+    def _is_metadata_phase(self) -> bool:
+        """True while notifications carry handshake/metadata text, not live frames."""
+        return (
+            self._collecting_handshake_payload
+            or self._collecting_names
+            or (self._handshake and not self._controllers_done)
+        )
+
+    def _feed_metadata_bytes(self, data: bytes):
         try:
             s = data.decode("utf-8")
         except Exception as e:
@@ -375,40 +416,7 @@ class RtBridge(QtCore.QObject):
                                 self._reset_stream()
                                 return
                             # Emit payload; pad/crop to 16 entries for safety
-                            values = list(self._payload)
-                            if len(values) < 16:
-                                values.extend([0.0] * (16 - len(values)))
-                            elif len(values) > 16:
-                                values = values[:16]
-                            self.rtDataUpdated.emit(values)
-                            
-                            # Track data rate and timing
-                            self._data_packet_count += 1
-                            self._total_packets_received += 1
-                            current_time = time.monotonic()
-                            
-                            if self._monitoring_start_time is None:
-                                self._monitoring_start_time = current_time
-                            
-                            if self._last_packet_time is not None:
-                                interval = (current_time - self._last_packet_time) * 1000  # Convert to ms
-                                self._packet_intervals.append(interval)
-                                
-                                # Detect dropped packets (interval > 2.5x expected)
-                                # More conservative threshold to avoid false positives from jitter
-                                expected_interval = 1000.0 / self._expected_hz if self._expected_hz > 0 else 14.3
-                                if interval > expected_interval * 2.5:
-                                    # Estimate how many packets were dropped
-                                    dropped = int(round(interval / expected_interval)) - 1
-                                    self._dropped_packet_count += max(0, dropped)
-                                    self._consecutive_drops += dropped
-                                    if self._consecutive_drops > self._max_consecutive_drops:
-                                        self._max_consecutive_drops = self._consecutive_drops
-                                else:
-                                    # Reset consecutive drop counter on successful packet
-                                    self._consecutive_drops = 0
-                            
-                            self._last_packet_time = current_time
+                            self._publish_rt_data(list(self._payload))
                             
                             # reset state
                             self._reset_stream()
@@ -462,6 +470,159 @@ class RtBridge(QtCore.QObject):
             self.logger.error(f"Failed to parse parameter update ack: {e}")
             self.logger.debug(traceback.format_exc())
 
+    def _publish_rt_data(self, values: List[float]):
+        """Pad/crop a completed real-time frame, emit it, and update rate stats."""
+        values = list(values)
+        if len(values) < 16:
+            values.extend([0.0] * (16 - len(values)))
+        elif len(values) > 16:
+            values = values[:16]
+        self.rtDataUpdated.emit(values)
+
+        # Track data rate and timing
+        self._data_packet_count += 1
+        self._total_packets_received += 1
+        current_time = time.monotonic()
+
+        if self._monitoring_start_time is None:
+            self._monitoring_start_time = current_time
+
+        if self._last_packet_time is not None:
+            interval = (current_time - self._last_packet_time) * 1000  # Convert to ms
+            self._packet_intervals.append(interval)
+
+            # Detect dropped packets (interval > 2.5x expected). More
+            # conservative threshold to avoid false positives from jitter.
+            expected_interval = 1000.0 / self._expected_hz if self._expected_hz > 0 else 14.3
+            if interval > expected_interval * 2.5:
+                dropped = int(round(interval / expected_interval)) - 1
+                self._dropped_packet_count += max(0, dropped)
+                self._consecutive_drops += dropped
+                if self._consecutive_drops > self._max_consecutive_drops:
+                    self._max_consecutive_drops = self._consecutive_drops
+            else:
+                self._consecutive_drops = 0
+
+        self._last_packet_time = current_time
+
+    def _drain_frames(self):
+        """Extract every complete protocol frame from the reassembly buffer."""
+        while self._rx_buffer:
+            buf = self._rx_buffer
+            parsed = self._parse_frame(buf)
+            if parsed is None:
+                if len(buf) > self._max_frame_buffer:
+                    self.logger.warning(
+                        "Dropping oversized frame buffer (%d bytes)", len(buf)
+                    )
+                    self._rx_buffer = b""
+                return
+            if parsed is False:
+                self.logger.warning(
+                    "Discarding malformed frame bytes: %r", bytes(buf[:32])
+                )
+                next_start = buf.find(b"S", 1)
+                self._rx_buffer = buf[next_start:] if next_start != -1 else b""
+                continue
+            end, command, count, tokens = parsed
+            self._rx_buffer = buf[end:]
+            self._process_frame(command, count, tokens)
+
+    def _parse_frame(self, buf: bytes, allow_unterminated_tail: bool = False):
+        """Parse one ``S<command><count>c<v>n...`` frame.
+
+        Returns ``(end, command, count, tokens)`` on success, ``None`` when the
+        buffer holds only an incomplete prefix, or ``False`` when the bytes
+        cannot begin a frame and the stream must resynchronise. When
+        ``allow_unterminated_tail`` is set, a final token without its trailing
+        delimiter is accepted (BLE truncates oversized notifications).
+        """
+        if not buf or buf[0:1] != b"S":
+            return False
+        if len(buf) < 2:
+            return None
+        command = buf[1:2]
+        index = 2
+        digits_start = index
+        while index < len(buf) and 0x30 <= buf[index] <= 0x39:
+            index += 1
+        if index == digits_start:
+            return None if index >= len(buf) else False
+        if index >= len(buf):
+            return None
+        if buf[index:index + 1] != b"c":
+            return False
+        try:
+            count = int(buf[digits_start:index])
+        except ValueError:
+            return False
+        if count < 0 or count > self._max_protocol_values:
+            return False
+        index += 1
+        tokens: List[bytes] = []
+        for _ in range(count):
+            delimiter = buf.find(b"n", index)
+            if delimiter == -1:
+                if (
+                    allow_unterminated_tail
+                    and len(tokens) == count - 1
+                    and index < len(buf)
+                ):
+                    tokens.append(buf[index:])
+                    return len(buf), command, count, tokens
+                return None
+            tokens.append(buf[index:delimiter])
+            index = delimiter + 1
+        return index, command, count, tokens
+
+    def _process_frame(self, command: bytes, count: int, tokens: List[bytes]):
+        """Route a fully reassembled frame to the ACK or real-time handler."""
+        self.logger.debug(
+            "Parsed frame: command=%r count=%d payload=%r",
+            command.decode("ascii", errors="replace"),
+            count,
+            [token.decode("ascii", errors="replace") for token in tokens],
+        )
+        if command == b"a":
+            event_data = b"n".join(tokens).decode("ascii", errors="ignore")
+            self._handle_param_update_ack(event_data, count)
+            return
+
+        values: List[float] = []
+        for token in tokens:
+            try:
+                values.append(float(token) / 100.0)
+            except Exception:
+                self.logger.warning("Skipping non-numeric frame token: %r", token)
+        # Single-value frames are BLE fragmentation artefacts, not real packets.
+        if len(values) <= 1:
+            return
+        self._publish_rt_data(values)
+
+    def _flush_partial_frame(self):
+        """Accept a trailing frame whose final delimiter was dropped by BLE.
+
+        A 21-byte ACK is truncated to the 20-byte minimum ATT payload, so the
+        final ``n`` never arrives. If no bytes complete the frame within the
+        flush window, treat the last token as terminated.
+        """
+        buf = self._rx_buffer
+        if not buf:
+            return
+        parsed = self._parse_frame(buf, allow_unterminated_tail=True)
+        if isinstance(parsed, tuple):
+            end, command, count, tokens = parsed
+            self._rx_buffer = buf[end:]
+            self._process_frame(command, count, tokens)
+            self._drain_frames()
+            if self._rx_buffer:
+                self._frame_flush_timer.start(self._frame_flush_ms)
+            return
+        self.logger.warning(
+            "Dropping incomplete frame after flush timeout: %r", bytes(buf[:32])
+        )
+        self._rx_buffer = b""
+
     def reset_for_new_ble_session(self):
         """Drop handshake/name/controller parse state before data from the next link arrives."""
         self._handshake = False
@@ -477,6 +638,7 @@ class RtBridge(QtCore.QObject):
         self._rows_38.clear()
         self._collecting_handshake_payload = False
         self._handshake_payload_buf = ""
+        self._rx_buffer = b""
         self._reset_stream()
     
     def print_trial_summary(self):
