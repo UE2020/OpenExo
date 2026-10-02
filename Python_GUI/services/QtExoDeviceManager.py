@@ -44,6 +44,7 @@ class QtExoDeviceManager(QtCore.QObject):
     scanProgress = QtCore.Signal(int)       # scan progress percentage (0-100)
     connectScanProgress = QtCore.Signal(int) # scanning phase during connection (0-100)
     connectionProgress = QtCore.Signal(int) # connection progress percentage (0-100)
+    trialStarted = QtCore.Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -961,6 +962,19 @@ class QtExoDeviceManager(QtCore.QObject):
             "Motor ON command sent",
         )
 
+    def requestControllerValues(self, joint_id: int) -> bool:
+        """Read the active controller and float32 parameters from the MCU."""
+        if not self._ensure_connected():
+            return False
+        if (joint_id != int(joint_id) or not 0 <= joint_id <= 255
+                or (joint_id & 0x60) not in (0x20, 0x40)):
+            raise ValueError(f"Invalid joint ID: {joint_id}")
+        queued = self._queue_write_steps(
+            [(b"Q", False, 0.0), (struct.pack("<d", joint_id), False, 0.0)],
+            f"Controller settings requested for joint {joint_id}",
+        )
+        return queued is not None
+
     @QtCore.Slot(list)
     def updateTorqueValues(self, parameter_list: list) -> bool:
         """Queue a controller parameter update.
@@ -995,8 +1009,7 @@ class QtExoDeviceManager(QtCore.QObject):
                     (struct.pack("<d", float(val)), False, delay_after)
                 )
 
-        self._queue_write_steps(steps, "Torque parameters updated")
-        return True
+        return self._queue_write_steps(steps, "Torque parameters updated") is not None
 
     @QtCore.Slot(float, float)
     def sendFsrValues(self, left_fsr: float, right_fsr: float):
@@ -1177,7 +1190,7 @@ class QtExoDeviceManager(QtCore.QObject):
             self.logger.warning("beginTrial() aborted - not connected")
             return
 
-        self._queue_write_steps(
+        future = self._queue_write_steps(
             [
                 (b"E", False, 0.0),
                 (b"L", False, 0.0),
@@ -1196,6 +1209,10 @@ class QtExoDeviceManager(QtCore.QObject):
             "Begin trial sequence sent",
             initial_delay_s=1.0,
         )
+        if future is not None:
+            future.add_done_callback(
+                lambda completed: self.trialStarted.emit() if completed.result() else None
+            )
 
     def _ensure_loop(self):
         if self._loop and self._loop_thread and self._loop_thread.is_alive():

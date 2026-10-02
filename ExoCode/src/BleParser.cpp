@@ -119,6 +119,14 @@ BleMessage *BleParser::handle_raw_data(char *buffer, int length)
             {
                 double f_tmp = 0;
                 memcpy(&f_tmp, &_buffer[i], sizeof(double));
+                // Q routing must be validated before narrowing the binary double.
+                if (return_msg->command == ble_names::get_live_controller_params &&
+                    (!isfinite(f_tmp) || f_tmp < 0.0 || f_tmp > 255.0 ||
+                     f_tmp != static_cast<double>(static_cast<uint8_t>(f_tmp))))
+                {
+                    reset();
+                    return return_msg;
+                }
                 return_msg->data[i / sizeof(double)] = static_cast<float>(f_tmp);
             }
             return_msg->is_complete = true;
