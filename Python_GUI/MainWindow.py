@@ -4,6 +4,9 @@ import time
 import os
 import logging
 import traceback
+import math
+import struct
+from collections import deque
 from datetime import datetime
 
 try:
@@ -80,6 +83,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Services
         self.qt_dev = QtExoDeviceManager(self)
+        self.qt_dev.trialStarted.connect(self._on_trial_started)
         # Bind scan page scanner to use the Qt device manager for scanning
         try:
             self.scan_page.bind_device_manager(self.qt_dev)
@@ -97,11 +101,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rt_bridge.controllerMatrixReceived.connect(self._on_controller_matrix)
         self.rt_bridge.controllerValuesReceived.connect(self._on_controller_values)
         self.rt_bridge.paramUpdateAckReceived.connect(self._on_param_update_ack)
+        self.rt_bridge.liveControllerValuesReceived.connect(self._on_live_controller_values)
 
         # CSV logging state
         self._csv_file = None
         self._csv_writer = None
         self._csv_header_written = False
+        self._csv_controller_columns = []
+        self._csv_data_count = 0
         self._param_names = []
         self._t0 = None
         self._csv_path_last = None
@@ -114,6 +121,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._controller_values = {}
         self._pending_param_updates = {}
         self._pending_param_update_seq = 0
+        self._controller_batch = deque()
+        self._controller_batch_total = 0
+        self._controller_batch_applied = 0
+        self._active_controllers = {}
+        self._confirmed_controller_joints = set()
+        self._controller_readback_queue = deque()
+        self._controller_readback_joint = None
+        self._controller_readback_token = 0
+        self._trial_starting = False
         # Device control wiring from ActiveTrialPage
         self.trial_page.deviceStartRequested.connect(self._on_device_start)
         self.trial_page.deviceStopRequested.connect(self._on_device_stop_motors)
@@ -152,6 +168,11 @@ class MainWindow(QtWidgets.QMainWindow):
         super().resizeEvent(event)
 
     def _go_trial(self):
+        self._trial_starting = True
+        self._confirmed_controller_joints.clear()
+        self._controller_readback_queue.clear()
+        self._controller_readback_joint = None
+        self._controller_readback_token += 1
         self.stack.setCurrentWidget(self.trial_page)
         # Stop simulation so live data drives plots if available
         self.trial_page.stop_sim()
@@ -177,6 +198,11 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             self.logger.error(f"Failed to begin trial: {e}")
             self.logger.debug(traceback.format_exc())
+
+    @QtCore.Slot()
+    def _on_trial_started(self):
+        self._trial_starting = False
+        self._request_controller_values()
 
     @QtCore.Slot(str)
     def _on_connect_requested(self, mac: str):
@@ -213,6 +239,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         header.extend(self._param_names[:10])
                     else:
                         header.extend([f"data{i}" for i in range(min(10, len(values)))])
+                    self._csv_data_count = len(header) - 2
+                    header.extend(column[0] for column in self._csv_controller_columns)
                     try:
                         self._csv_writer.writerow(header)
                         self._csv_header_written = True
@@ -223,8 +251,11 @@ class MainWindow(QtWidgets.QMainWindow):
                         self.logger.debug(traceback.format_exc())
                 # Write row - only include first 10 data values
                 epoch_time = time.time()
-                data_values = values[:10] if len(values) > 10 else values
-                row = [f"{epoch_time:.6f}", str(self._mark_counter)] + [f"{v:.6f}" for v in data_values]
+                data_values = list(values[:self._csv_data_count])
+                data_values.extend([None] * (self._csv_data_count - len(data_values)))
+                row = [f"{epoch_time:.6f}", str(self._mark_counter)]
+                row.extend("" if v is None else f"{v:.6f}" for v in data_values)
+                row.extend(self._controller_csv_values())
                 try:
                     self._csv_writer.writerow(row)
                 except Exception as e:
@@ -325,8 +356,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _normalized_controller_values(self, overlay: dict) -> dict:
         """
         Build a full value DB aligned to _controller_matrix: one entry per (joint_id, controller_id)
-        with list length matching the parameter name count (row[4:]). Missing overlay entries pad with "0";
-        excess overlay values are truncated.
+        with list length matching the parameter name count (row[4:]).
+        Missing values remain unknown rather than being fabricated as zero.
         """
         out: dict = {}
         overlay = overlay or {}
@@ -338,9 +369,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 key = (jid, cid)
                 n_params = max(0, len(row) - 4)
                 raw = overlay.get(key, [])
-                vals = [str(v) for v in raw]
+                vals = [None if v is None else str(v) for v in raw]
                 if len(vals) < n_params:
-                    vals.extend(["0"] * (n_params - len(vals)))
+                    vals.extend([None] * (n_params - len(vals)))
                 elif len(vals) > n_params:
                     vals = vals[:n_params]
                 out[key] = vals
@@ -351,24 +382,120 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(list)
     def _on_controller_values(self, rows):
-        try:
-            overlay = {}
-            for row in rows:
-                if len(row) >= 2:
-                    key = (str(row[0]), str(row[1]))
-                    overlay[key] = [str(v) for v in row[2:]]
-            if self._controller_matrix:
-                self._controller_values = self._normalized_controller_values(overlay)
+        # Legacy v rows contain SD-file defaults, not the live MCU parameters.
+        # They cannot establish the settings used by a trial.
+        self._controller_values = self._normalized_controller_values({})
+        self.settings_page.set_controller_values(self._controller_values)
+        self._request_controller_values()
+
+    def _request_controller_values(self):
+        if self._trial_starting or self._controller_readback_joint is not None or self._pending_param_updates:
+            return
+        joints = list(dict.fromkeys(
+            str(row[1]) for row in self._controller_matrix if len(row) >= 4
+        ))
+        self._controller_readback_queue = deque(joints)
+        self._confirmed_controller_joints.difference_update(joints)
+        for key, values in self._controller_values.items():
+            if key[0] in joints:
+                self._controller_values[key] = [None] * len(values)
+        self.settings_page.set_controller_values(self._controller_values)
+        self.settings_page.set_active_controllers({})
+        self._send_next_controller_readback()
+
+    def _send_next_controller_readback(self):
+        if not self._controller_readback_queue:
+            self._controller_readback_joint = None
+            self.settings_page.set_update_pending(False)
+            return
+        joint_id = self._controller_readback_queue.popleft()
+        self._controller_readback_joint = joint_id
+        self._controller_readback_token += 1
+        token = self._controller_readback_token
+        self.settings_page.set_update_pending(True)
+        if not self.qt_dev.requestControllerValues(int(joint_id)):
+            self._on_controller_readback_timeout(joint_id, token)
+            return
+        QtCore.QTimer.singleShot(
+            3000, lambda: self._on_controller_readback_timeout(joint_id, token)
+        )
+
+    def _on_controller_readback_timeout(self, joint_id, token):
+        if self._controller_readback_joint != joint_id or self._controller_readback_token != token:
+            return
+        self._show_param_update_status(
+            f"Live settings unavailable for joint {joint_id}; readback firmware is required. CSV values remain unknown.",
+            warning=True,
+        )
+        self._send_next_controller_readback()
+
+    @QtCore.Slot(dict)
+    def _on_live_controller_values(self, snapshot):
+        joint_id = str(snapshot["joint_id"])
+        if self._trial_starting or joint_id != self._controller_readback_joint:
+            return
+        controller_id = str(snapshot["controller_id"])
+        values = snapshot["values"]
+        schema = next((
+            row for row in self._controller_matrix
+            if len(row) >= 4 and str(row[1]) == joint_id and str(row[3]) == controller_id
+        ), None)
+        if schema is not None and len(values) != len(schema) - 4:
+            self.logger.warning("Controller snapshot length does not match metadata for %s", joint_id)
+            return
+        self._active_controllers[joint_id] = controller_id
+        self._controller_values[(joint_id, controller_id)] = [str(value) for value in values]
+        # Inactive controllers reload defaults on selection; previously used
+        # values must not seed a later edit as though they were still in use.
+        for key in list(self._controller_values):
+            if key[0] == joint_id and key[1] != controller_id:
+                self._controller_values[key] = [None] * len(self._controller_values[key])
+        self._confirmed_controller_joints.add(joint_id)
+        self.settings_page.set_controller_values(self._controller_values)
+        self.settings_page.set_active_controllers({
+            joint: controller for joint, controller in self._active_controllers.items()
+            if joint in self._confirmed_controller_joints
+        })
+        self._send_next_controller_readback()
+
+    def _build_controller_csv_columns(self):
+        columns = []
+        joints = dict.fromkeys(str(row[1]) for row in self._controller_matrix if len(row) >= 4)
+        for joint_id in joints:
+            columns.extend([
+                (f"controller_{joint_id}_id", joint_id, None, None),
+                (f"controller_{joint_id}_status", joint_id, None, "status"),
+            ])
+        for row in self._controller_matrix:
+            if len(row) < 4:
+                continue
+            joint_id, controller_id = str(row[1]), str(row[3])
+            for index, name in enumerate(row[4:]):
+                columns.append((
+                    f"controller_{joint_id}_{controller_id}_{index}_{name}",
+                    joint_id, controller_id, index,
+                ))
+        return columns or [("controller_settings_status", None, None, "status")]
+
+    def _controller_csv_values(self):
+        result = []
+        updating = {key[0] for key in self._pending_param_updates}
+        updating.update(str(update[0]) for update in self._controller_batch)
+        for _, joint_id, controller_id, index in self._csv_controller_columns:
+            confirmed = joint_id in self._confirmed_controller_joints and joint_id not in updating
+            active = self._active_controllers.get(joint_id)
+            if index == "status":
+                result.append("updating" if joint_id in updating else "confirmed" if confirmed else "unknown")
+            elif controller_id is None:
+                result.append(active if confirmed and active is not None else "")
+            elif confirmed and active == controller_id:
+                values = self._controller_values.get((joint_id, controller_id), [])
+                value = values[index] if index < len(values) else None
+                result.append("" if value is None else value)
             else:
-                self._controller_values = {k: list(v) for k, v in overlay.items()}
-            self.settings_page.set_controller_values(self._controller_values)
-            self.logger.info(
-                f"Controller value DB from device: {len(overlay)} raw keys, "
-                f"{len(self._controller_values)} entries after matrix alignment"
-            )
-        except Exception as e:
-            self.logger.error(f"Failed to store controller value DB: {e}")
-            self.logger.debug(traceback.format_exc())
+                result.append("")
+        return result
+
 
     def _queue_pending_param_updates(self, updates):
         for joint_id, controller_id, param_index, value in updates:
@@ -394,6 +521,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _clear_pending_param_updates(self, reason: str = ""):
         """Drop ack waiters from a finished link so the next link cannot consume them."""
+        self._controller_batch.clear()
+        self.settings_page.set_update_pending(False)
+        self._controller_readback_queue.clear()
+        self._controller_readback_joint = None
+        self._controller_readback_token += 1
         if not self._pending_param_updates:
             return
         pending = sum(len(records) for records in self._pending_param_updates.values())
@@ -431,8 +563,8 @@ class MainWindow(QtWidgets.QMainWindow):
         key = (str(joint_id), str(controller_id))
         values = list(self._controller_values.get(key, []))
         while len(values) <= int(param_index):
-            values.append("0")
-        values[int(param_index)] = str(value)
+            values.append(None)
+        values[int(param_index)] = None if value is None else str(value)
         self._controller_values[key] = values
         self.settings_page.set_controller_values(self._controller_values)
 
@@ -488,6 +620,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         param_index,
                         record["value"],
                     )
+                    self._controller_batch_applied += 1
+                    self._send_next_controller_update()
                 self.logger.info(
                     "Parameter update accepted: joint=%s controller=%s index=%s",
                     joint_id,
@@ -505,6 +639,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 reason_text,
             )
             self._show_param_update_status(f"Controller update rejected: {reason_text}", warning=True)
+            if record is not None:
+                self._finish_controller_batch(
+                    f"Rejected joint {joint_id}, parameter {param_index}: {reason_text}"
+                )
         except Exception as e:
             self.logger.error(f"Failed to handle parameter update ack: {e}")
             self.logger.debug(traceback.format_exc())
@@ -520,7 +658,8 @@ class MainWindow(QtWidgets.QMainWindow):
             controller_id,
             param_index,
         )
-        self._show_param_update_status("Controller update unconfirmed: no device acknowledgement", warning=True)
+        self._update_controller_value_cache(joint_id, controller_id, param_index, None)
+        self._finish_controller_batch("No device acknowledgement; applied settings are uncertain")
 
     @QtCore.Slot()
     def _on_device_start(self):
@@ -738,10 +877,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if has_matrix:
             try:
                 self.settings_page.set_controller_matrix(self._controller_matrix)
+                self.settings_page.set_controller_values(self._controller_values)
             except Exception as e:
                 self.logger.error(f"Failed to set controller matrix in settings: {e}")
                 self.logger.debug(traceback.format_exc())
             self.stack.setCurrentWidget(self.settings_page)
+            self._request_controller_values()
         else:
             self.stack.setCurrentWidget(self.basic_settings_page)
 
@@ -771,39 +912,68 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(list)
     def _on_apply_settings(self, payload):
-        # payload: [isBilateral, joint, controller, parameter, value]
-        self.logger.info(f"Applying settings: {payload}")
+        if self._controller_readback_joint is not None:
+            self._show_param_update_status("Wait for live controller settings before applying", warning=True)
+            return
+        if self._pending_param_updates or self._controller_batch:
+            self._show_param_update_status("A controller update is already in progress", warning=True)
+            return
+        requests = payload if payload and isinstance(payload[0], list) else [payload]
         try:
-            updates = QtExoDeviceManager.build_parameter_updates(payload)
-        except Exception as e:
-            self.logger.error(f"Invalid parameter update request: {e}")
-            self.logger.debug(traceback.format_exc())
+            updates = []
+            for request in requests:
+                for joint_id, controller_id, param_index, value in QtExoDeviceManager.build_parameter_updates(request):
+                    if not math.isfinite(value):
+                        raise ValueError("Controller values must be finite")
+                    # Firmware stores float32 values, not the GUI's float64.
+                    value = struct.unpack("<f", struct.pack("<f", value))[0]
+                    updates.append((joint_id, controller_id, param_index, value))
+            if len({update[:3] for update in updates}) != len(updates):
+                raise ValueError("Duplicate controller properties in update")
+        except (ValueError, TypeError, OverflowError, struct.error) as e:
             self._show_param_update_status(f"Controller update not sent: {e}", warning=True)
             return
+        if not updates:
+            self._show_param_update_status("No controller properties changed", warning=False)
+            return
+        self._controller_batch = deque(updates)
+        self._controller_batch_total = len(updates)
+        self._controller_batch_applied = 0
+        self._confirmed_controller_joints.difference_update(str(update[0]) for update in updates)
+        self.settings_page.set_update_pending(True)
+        self._send_next_controller_update()
 
-        # Submit first: only await acknowledgements for a request that was
-        # actually queued, otherwise a disconnected link looks like a device
-        # acknowledgement failure ten seconds later.
+    def _send_next_controller_update(self):
+        if not self._controller_batch:
+            self._finish_controller_batch()
+            return
+        update = self._controller_batch.popleft()
+        joint_id, controller_id, param_index, value = update
         try:
-            submitted = self.qt_dev.updateTorqueValues(payload)
+            submitted = self.qt_dev.updateTorqueValues(
+                [False, joint_id, controller_id, param_index, value]
+            )
         except Exception as e:
-            self.logger.error(f"Failed to update torque values: {e}")
-            self.logger.debug(traceback.format_exc())
-            submitted = False
+            self.logger.exception("Failed to submit controller property")
+            self._finish_controller_batch(f"Transport failed: {e}")
+            return
+        if not submitted:
+            self._finish_controller_batch("Device not connected; update not sent")
+            return
+        self._queue_pending_param_updates([update])
+        self._show_param_update_status(
+            f"Applying controller properties: {self._controller_batch_applied}/{self._controller_batch_total}",
+            warning=False,
+        )
 
-        if submitted:
-            self._queue_pending_param_updates(updates)
-            self._show_param_update_status("", warning=False)
-        else:
-            self.logger.warning("Controller update was not submitted; no acknowledgement awaited")
-            self._show_param_update_status("Controller update not sent: device not connected", warning=True)
-
-        # Return to trial page
-        try:
-            self.stack.setCurrentWidget(self.trial_page)
-        except Exception as e:
-            self.logger.error(f"Failed to navigate to trial page after settings: {e}")
-            self.logger.debug(traceback.format_exc())
+    def _finish_controller_batch(self, error=None):
+        self._controller_batch.clear()
+        self.settings_page.set_update_pending(False)
+        message = f"{self._controller_batch_applied}/{self._controller_batch_total} properties acknowledged"
+        if error:
+            message = f"{error}. {message}; remaining properties were not sent."
+        self._show_param_update_status(message, warning=bool(error))
+        self._request_controller_values()
 
     def _clear_ble_prefs_on_new_connection(self):
         """Purge saved Update-Controller prefs and in-memory selections for a new link.
@@ -826,9 +996,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _destroy_controller_db(self):
         self._clear_ble_prefs_on_new_connection()
+        self._clear_pending_param_updates("controller database cleared")
         try:
             self._controller_matrix = []
             self._controller_values = {}
+            self._active_controllers.clear()
+            self._confirmed_controller_joints.clear()
+            self._trial_starting = False
             self.settings_page.set_controller_matrix([])
             self.settings_page.set_controller_values({})
         except Exception as e:
@@ -906,6 +1080,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._controller_matrix:
                 self.settings_page.set_controller_matrix(self._controller_matrix)
                 self.settings_page.set_controller_values(self._controller_values)
+                self._request_controller_values()
         except Exception as e:
             self.logger.error(f"Failed to sync settings page after connect: {e}")
             self.logger.debug(traceback.format_exc())
@@ -987,6 +1162,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._csv_file = open(fname, "x", newline="")
             self._csv_writer = csv.writer(self._csv_file)
             self._csv_header_written = False
+            self._csv_controller_columns = self._build_controller_csv_columns()
+            self._request_controller_values()
             self._t0 = None
             self._mark_counter = 0  # Reset mark counter for new trial
             self._csv_path_last = fname

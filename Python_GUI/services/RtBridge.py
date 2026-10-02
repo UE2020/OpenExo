@@ -2,6 +2,7 @@ from typing import List
 import time
 import logging
 import traceback
+import math
 
 try:
     from PySide6 import QtCore
@@ -25,6 +26,7 @@ class RtBridge(QtCore.QObject):
     controllerMatrixReceived = QtCore.Signal(list)
     controllerValuesReceived = QtCore.Signal(list)
     paramUpdateAckReceived = QtCore.Signal(dict)
+    liveControllerValuesReceived = QtCore.Signal(dict)
     rtDataUpdated = QtCore.Signal(list)
 
     def __init__(self, parent=None):
@@ -562,6 +564,9 @@ class RtBridge(QtCore.QObject):
         tokens: List[bytes] = []
         for _ in range(count):
             delimiter = buf.find(b"n", index)
+            next_start = buf.find(b"S", index)
+            if next_start != -1 and (delimiter == -1 or next_start < delimiter):
+                return False  # A new frame starts before this numeric token ends.
             if delimiter == -1:
                 if (
                     allow_unterminated_tail
@@ -588,6 +593,24 @@ class RtBridge(QtCore.QObject):
             self._handle_param_update_ack(event_data, count)
             return
 
+        if command == b"p":
+            # Readback uses unscaled ASCII float32 values to preserve small PID
+            # gains; telemetry and ACK frames retain their existing x100 format.
+            try:
+                values = [float(token) for token in tokens]
+                if count < 2 or not all(math.isfinite(value) for value in values):
+                    raise ValueError("Invalid controller snapshot")
+                joint_id, controller_id = values[:2]
+                if any(value != int(value) or not 0 <= value <= 255 for value in values[:2]):
+                    raise ValueError("Invalid controller snapshot routing")
+                self.liveControllerValuesReceived.emit({
+                    "joint_id": int(joint_id),
+                    "controller_id": int(controller_id),
+                    "values": values[2:],
+                })
+            except ValueError as e:
+                self.logger.warning("Ignoring controller snapshot: %s", e)
+            return
         values: List[float] = []
         for token in tokens:
             try:
@@ -609,7 +632,9 @@ class RtBridge(QtCore.QObject):
         buf = self._rx_buffer
         if not buf:
             return
-        parsed = self._parse_frame(buf, allow_unterminated_tail=True)
+        # Snapshots are chunked losslessly; accepting a truncated numeric tail
+        # could silently turn a PID gain into a different confirmed value.
+        parsed = self._parse_frame(buf, allow_unterminated_tail=not buf.startswith(b"Sp"))
         if isinstance(parsed, tuple):
             end, command, count, tokens = parsed
             self._rx_buffer = buf[end:]

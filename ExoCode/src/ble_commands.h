@@ -51,6 +51,7 @@ namespace ble_names
     static const char motors_off        = 'w';
     static const char mark              = 'N';
     static const char update_param      = 'f';
+    static const char get_live_controller_params = 'Q';
     static const char reset_system      = 'Z';
 
     //Sending Commands (Firmware->GUI)
@@ -62,6 +63,7 @@ namespace ble_names
     static const char send_step_count     = 's';
     static const char cal_fsr_finished    = 'n';
     static const char param_update_ack    = 'a';
+    static const char live_controller_params = 'p';
 
 };
 
@@ -86,6 +88,7 @@ namespace ble
         {ble_names::new_fsr,            2},
         {ble_names::new_trq,            4},
         {ble_names::update_param,       4},
+        {ble_names::get_live_controller_params, 1},
         {ble_names::reset_system,       0},
         
         //Sending Commands
@@ -425,6 +428,26 @@ namespace ble_handlers
         tx_msg.data[(uint8_t)UART_command_enums::FSR_thresholds::LEFT_THRESHOLD] = msg->data[0];
         tx_msg.data[(uint8_t)UART_command_enums::FSR_thresholds::RIGHT_THRESHOLD] = msg->data[1];
         uart_handler->UART_msg(tx_msg);
+    }
+
+    inline static void get_live_controller_params(ExoData* data, BleMessage* msg)
+    {
+        uint8_t joint_id = 0;
+        if (msg == NULL || !msg->is_complete || msg->expecting != 1 ||
+            !param_update::try_float_to_uint8(msg->data[0], &joint_id) ||
+            msg->data[0] != (float)joint_id ||
+            !param_update::has_valid_side(joint_id) ||
+            !param_update::has_valid_joint_type(joint_id))
+        {
+            return;
+        }
+
+        // The Teensy, not the Nano's metadata, determines whether this joint is used.
+        UART_msg_t request;
+        request.command = UART_command_names::get_live_controller_params;
+        request.joint_id = joint_id;
+        request.len = 0;
+        UARTHandler::get_instance()->UART_msg(request);
     }
 
     inline static param_update::RejectionReason update_param(

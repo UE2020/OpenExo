@@ -1,3 +1,25 @@
+## Controller-settings readback
+
+The Python GUI's live controller values and CSV settings require **both Teensy
+and Nano** firmware from the controller-readback revision. Bulk Apply still uses
+the existing `f`/`a` parameter-update protocol; readback adds BLE `Q`/`p` and UART
+`0x1C`/`0x1D`. Flashing only one board is insufficient. No SD controller-file
+changes are required.
+
+With Arduino CLI and the board packages installed, compile from the repository root:
+
+```sh
+arduino-cli lib install SD
+arduino-cli compile --fqbn teensy:avr:teensy41 --libraries Libraries ExoCode
+arduino-cli compile --fqbn arduino:mbed_nano:nano33ble --libraries Libraries ExoCode
+```
+
+The SD library is needed by the shared firmware headers when compiling the Nano.
+Follow the flashing steps below for each board. Hardware validation should check
+live readback after startup, a multi-property Apply (including both sides), and a
+recorded CSV with small PID gains; builds and host smoke runs do not prove delivery
+over the physical BLE/UART links.
+
 ## Downloads
 1. Download Arduino IDE 1.8.19, which can be found [here](https://www.arduino.cc/en/software) or [here](https://drive.google.com/drive/folders/1IRxJFNm2gxUtCeU8Dcavg_Mv2ubANOHK?usp=drive_link)
 2. Now install Teensyduino, which can be found [here](https://www.pjrc.com/teensy/td_download.html) or [here](https://drive.google.com/drive/folders/1IRxJFNm2gxUtCeU8Dcavg_Mv2ubANOHK?usp=drive_link). Be sure to install the 1.56 version for your system.

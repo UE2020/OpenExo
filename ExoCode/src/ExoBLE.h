@@ -25,6 +25,7 @@
 #include "GattDb.h"
 #include "BleMessage.h"
 #include "BleMessageQueue.h"
+#include "UART_msg_t.h"
 
 class ExoBLE 
 {
@@ -68,6 +69,9 @@ class ExoBLE
          *         peer was subscribed to notifications.
          */
         bool send_message(BleMessage &msg);
+
+        // Raw float32 readback: variable-length p frame, never telemetry scaling.
+        bool send_controller_snapshot(const UART_msg_t &msg);
 
         /**
          * @brief Send an error code to the GUI, uses a seperate service and characteristic

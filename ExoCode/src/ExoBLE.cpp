@@ -8,6 +8,9 @@
 #include "error_codes.h"
 #include "Logger.h"
 #include "GetBulkChar.h"
+#include "uart_commands.h"
+#include <math.h>
+#include <stdio.h>
 
 #define EXOBLE_DEBUG 0
 
@@ -369,6 +372,74 @@ bool ExoBLE::send_message(BleMessage &msg)
     {
         logger::println("ExoBLE::send_message notification not delivered", LogLevel::Warn);
         return false;
+    }
+    return true;
+}
+
+bool ExoBLE::send_controller_snapshot(const UART_msg_t &msg)
+{
+    const uint8_t param_start = (uint8_t)UART_command_enums::live_controller_params::PARAM_START;
+    uint8_t controller_id = 0;
+    uint8_t param_count = 0;
+    if (!_connected || !_tx_subscribed || !_gatt_db.TXChar.subscribed() ||
+        msg.command != UART_command_names::update_live_controller_params ||
+        msg.len < param_start || msg.len > UART_MSG_T_MAX_DATA_LEN ||
+        !param_update::has_valid_side(msg.joint_id) ||
+        !param_update::has_valid_joint_type(msg.joint_id) ||
+        !param_update::try_float_to_uint8(
+            msg.data[(uint8_t)UART_command_enums::live_controller_params::CONTROLLER_ID], &controller_id) ||
+        !param_update::try_float_to_uint8(
+            msg.data[(uint8_t)UART_command_enums::live_controller_params::PARAM_LENGTH], &param_count) ||
+        msg.data[(uint8_t)UART_command_enums::live_controller_params::CONTROLLER_ID] != (float)controller_id ||
+        msg.data[(uint8_t)UART_command_enums::live_controller_params::PARAM_LENGTH] != (float)param_count ||
+        param_count > controller_defs::max_parameters || param_count > 30 ||
+        msg.len != param_start + param_count)
+    {
+        return false;
+    }
+
+    // Host limits: 32 values, 512 frame characters, 16 characters per token.
+    // Build the entire frame before sending so invalid snapshots are not partial.
+    char frame[513];
+    int written = snprintf(frame, sizeof(frame), "S%c%uc%un%un",
+        ble_names::live_controller_params, (unsigned)(param_count + 2),
+        (unsigned)msg.joint_id, (unsigned)controller_id);
+    if (written <= 0 || written >= (int)sizeof(frame))
+    {
+        return false;
+    }
+    size_t length = (size_t)written;
+    for (uint8_t i = 0; i < param_count; ++i)
+    {
+        const float value = msg.data[param_start + i];
+        if (!isfinite(value))
+        {
+            return false;
+        }
+        written = snprintf(frame + length, sizeof(frame) - length, "%.9g", (double)value);
+        if (written <= 0 || written > 16 ||
+            length + (size_t)written + 1 > sizeof(frame) - 1)
+        {
+            return false;
+        }
+        length += (size_t)written;
+        frame[length++] = 'n';
+        frame[length] = '\0';
+    }
+
+    for (size_t offset = 0; offset < length;)
+    {
+        const size_t chunk_length = (length - offset > kHandshakeChunkSize)
+            ? kHandshakeChunkSize : length - offset;
+        if (!_connected || !_tx_subscribed || !BLE.connected() ||
+            !_gatt_db.TXChar.subscribed() ||
+            _gatt_db.TXChar.writeValue((const uint8_t *)(frame + offset), chunk_length) <= 0)
+        {
+            return false;
+        }
+        offset += chunk_length;
+        // Use the established handshake pacing to avoid overrunning notifications.
+        delay(20);
     }
     return true;
 }

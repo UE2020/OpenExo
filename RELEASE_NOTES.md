@@ -1,5 +1,25 @@
 # Release Notes
 
+## Controller Editor and Recorded Controller Settings
+
+### Changed
+- Python GUI controller editing shows all properties together, with current device
+  values and one Apply for multiple changes. Saved attempted values no longer
+  override device truth. Bilateral editing displays differing values on both sides.
+- Apply sends acknowledged, sequential single-property updates using the existing
+  firmware protocol. Rejection or timeout stops unsent properties and reports
+  partial completion; the update is not atomic.
+- Trial CSVs include per-joint active controller IDs, confirmation status, and all
+  catalog controller properties, including PID gains. Values follow confirmed
+  changes during recording; inactive or unknown values remain blank.
+
+### Firmware
+- New live-controller readback (`Q`/`p`, UART `0x1C`/`0x1D`) returns authoritative
+  active controller settings with float32 precision and lossless BLE chunking.
+  SD-default handshake values are no longer treated as live settings.
+- Flash both Teensy and Nano for live values. Existing firmware can still receive
+  property updates, but CSV settings stay unknown without readback support.
+
 ## Arm Configuration and arm_1/arm_2 Joints
 
 ### Added

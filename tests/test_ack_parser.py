@@ -8,7 +8,6 @@ the UI therefore never clears its pending acknowledgement.
 Run with: python tests/test_ack_parser.py
 """
 import importlib.util
-import logging
 from pathlib import Path
 import re
 import sys
@@ -66,15 +65,21 @@ qt = types.SimpleNamespace(
     QRegularExpression=Regex,
     Slot=lambda *args: lambda fn: fn,
 )
-sys.modules.setdefault("PySide6", types.SimpleNamespace(QtCore=qt))
+previous_pyside = sys.modules.get("PySide6")
+sys.modules["PySide6"] = types.SimpleNamespace(QtCore=qt)
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location(
     "tested_rt_bridge", ROOT / "Python_GUI/services/RtBridge.py"
 )
 module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-logging.disable(logging.CRITICAL)
+try:
+    spec.loader.exec_module(module)
+finally:
+    if previous_pyside is None:
+        del sys.modules["PySide6"]
+    else:
+        sys.modules["PySide6"] = previous_pyside
 
 
 # Firmware package_raw_data encodes S + command + count + c + integer*100 + n.
