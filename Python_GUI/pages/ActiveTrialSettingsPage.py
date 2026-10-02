@@ -13,7 +13,7 @@ _logger = logging.getLogger(__name__)
 
 
 class ActiveTrialSettingsPage(QtWidgets.QWidget):
-    """Edit all properties of a controller using acknowledged device values."""
+    """Edit live controller values or explicitly sourced per-mode presets."""
 
     # Each entry is [isBilateral, joint_id, controller_id, parameter_index, value].
     applyRequested = QtCore.Signal(list)
@@ -28,6 +28,8 @@ class ActiveTrialSettingsPage(QtWidgets.QWidget):
         self.setObjectName("ActiveTrialSettingsPage")
         self._controller_matrix = []
         self._controller_values = {}
+        self._controller_presets = {}
+        self._controller_defaults = {}
         self._active_controllers = {}
         self._joint_controllers = {}
         self._param_editors = []
@@ -73,15 +75,19 @@ class ActiveTrialSettingsPage(QtWidgets.QWidget):
         self.chk_bilateral.setChecked(self._last_selection["bilateral"])
         layout.addWidget(self.chk_bilateral)
         self.lbl_active_controller = QtWidgets.QLabel("In-use controller: unknown")
+        self.lbl_active_controller.setWordWrap(True)
         layout.addWidget(self.lbl_active_controller)
 
-        self.table = QtWidgets.QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["Parameter", "Device value", "New value"])
+        self.table = QtWidgets.QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(
+            ["Parameter", "Live device", "Proposed value", "Preset source"])
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
         self.table.verticalHeader().hide()
         self.table.verticalHeader().setDefaultSectionSize(UIConfig.TABLE_ROW_HEIGHT)
-        self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        header.setMinimumSectionSize(90)
         self.table.setMinimumHeight(80)
         self.table.setWordWrap(True)
         layout.addWidget(self.table, 1)
@@ -109,8 +115,9 @@ class ActiveTrialSettingsPage(QtWidgets.QWidget):
         self.btn_apply.clicked.connect(self._on_apply)
         self.btn_cancel.clicked.connect(self.cancelRequested.emit)
         self.btn_apply.setToolTip(
-            "Send changed properties in order, waiting for each acknowledgement. "
-            "Updates are not atomic; a rejection stops the remaining changes."
+            "Switching modes sends the full preset. In-use controllers receive only "
+            "edited changes. Bilateral edits affect both sides; untouched side values "
+            "are preserved. Updates are acknowledged in order and are not atomic."
         )
 
     @staticmethod
@@ -126,8 +133,8 @@ class ActiveTrialSettingsPage(QtWidgets.QWidget):
     def set_controller_matrix(self, matrix: list):
         """Set [joint display, joint ID, controller name, controller ID, parameters...].
 
-        Opening the page calls this method and discards attempted edits. Only the
-        acknowledged value cache is used to initialize the new editors.
+        Opening the page discards attempted edits, not confirmed per-mode presets.
+        Presets and SD defaults initialize proposed values, never device truth.
         """
         rows = []
         invalid = 0
@@ -178,24 +185,43 @@ class ActiveTrialSettingsPage(QtWidgets.QWidget):
 
     def set_controller_values(self, values_db: dict):
         """Refresh device truth without replacing unacknowledged user edits."""
-        self._controller_values = {
+        self._controller_values = self._copy_values(values_db)
+        self._refresh_values()
+
+    def set_controller_presets(self, presets: dict, defaults: dict):
+        """Set confirmed history and SD defaults without treating either as live."""
+        self._controller_presets = self._copy_values(presets)
+        self._controller_defaults = self._copy_values(defaults)
+        self._refresh_values()
+
+    @staticmethod
+    def _copy_values(values_db):
+        return {
             (str(key[0]), str(key[1])): list(values)
             for key, values in (values_db or {}).items()
             if isinstance(key, tuple) and len(key) == 2 and isinstance(values, (list, tuple))
         }
-        self._refresh_values()
 
     def set_active_controllers(self, controllers: dict):
-        self._active_controllers = dict(controllers)
+        self._active_controllers = {str(joint): str(controller)
+                                    for joint, controller in (controllers or {}).items()}
         self._refresh_active_controller()
+        self._refresh_values()
 
     def _refresh_active_controller(self):
-        joint_id = self.combo_joint.currentData()
-        controller_id = self._active_controllers.get(joint_id)
-        row = next((row for row in self._controller_matrix
-                    if row[1] == joint_id and row[3] == controller_id), None)
-        description = f"{row[2]} ({controller_id})" if row else controller_id or "unknown"
-        self.lbl_active_controller.setText(f"In-use controller: {description}")
+        selected = self._current_row()
+        mirror = self._mirror_row() if self.chk_bilateral.isChecked() else None
+        descriptions = []
+        for side in (selected, mirror):
+            if side is None:
+                continue
+            controller_id = self._active_controllers.get(side[1])
+            active = next((row for row in self._controller_matrix
+                           if row[1] == side[1] and row[3] == controller_id), None)
+            mode = f"{active[2]} ({controller_id})" if active else controller_id or "unknown"
+            descriptions.append(f"{side[0]}: {mode}")
+        self.lbl_active_controller.setText("In-use controller: " + (
+            " | ".join(descriptions) if descriptions else "unknown"))
 
 
     def set_update_pending(self, pending: bool):
@@ -220,6 +246,8 @@ class ActiveTrialSettingsPage(QtWidgets.QWidget):
         """Forget selections, cached truth and edits when the BLE device changes."""
         self._last_selection = {"bilateral": False, "joint": None, "controller": None}
         self._controller_values = {}
+        self._controller_presets.clear()
+        self._controller_defaults.clear()
         self._active_controllers.clear()
         self.chk_bilateral.blockSignals(True)
         self.chk_bilateral.setChecked(False)
@@ -275,7 +303,7 @@ class ActiveTrialSettingsPage(QtWidgets.QWidget):
         mirror_id = str(joint_id ^ self._SIDE_MASK)
         for candidate in self._controller_matrix:
             if (candidate[1] == mirror_id and candidate[3] == row[3]
-                    and candidate[2:] == row[2:]):
+                    and candidate[3:] == row[3:]):
                 return candidate
         return None
 
@@ -334,11 +362,12 @@ class ActiveTrialSettingsPage(QtWidgets.QWidget):
                 style_spinbox(spin, height=UIConfig.BTN_HEIGHT_SMALL,
                               font_size=UIConfig.FONT_SMALL)
                 spin.setMinimumWidth(0)
-                spin.valueChanged.connect(lambda _value, i=index: self._edited_parameters.add(i))
-                # Typing an explicit zero into an unknown zero-initialized field is an edit too.
-                spin.lineEdit().textEdited.connect(lambda _text, i=index: self._edited_parameters.add(i))
+                spin.valueChanged.connect(lambda _value, i=index: self._mark_edited(i))
+                # An explicit zero in a blank unknown field is an edit too.
+                spin.lineEdit().textEdited.connect(lambda _text, i=index: self._mark_edited(i))
                 self._param_editors.append(spin)
                 self.table.setCellWidget(index, 2, spin)
+                self.table.setItem(index, 3, QtWidgets.QTableWidgetItem("Unknown"))
         self._refresh_values()
         self._update_enabled_state()
         self._remember_selection()
@@ -347,12 +376,20 @@ class ActiveTrialSettingsPage(QtWidgets.QWidget):
     @QtCore.Slot(bool)
     def _on_bilateral_changed(self, _checked: bool):
         self._refresh_values()
+        self._refresh_active_controller()
         self._remember_selection()
 
-    def _cached_value(self, row, index):
+    def _mark_edited(self, index):
+        self._edited_parameters.add(index)
+        item = self.table.item(index, 3)
+        if item is not None:
+            item.setText("User edit (both sides)" if self.chk_bilateral.isChecked() else "User edit")
+
+    @staticmethod
+    def _value_from(values_db, row, index):
         if row is None:
             return None, None
-        values = self._controller_values.get((row[1], row[3]), [])
+        values = values_db.get((row[1], row[3]), [])
         if index >= len(values) or values[index] is None:
             return None, None
         raw = values[index]
@@ -363,6 +400,22 @@ class ActiveTrialSettingsPage(QtWidgets.QWidget):
         except (TypeError, ValueError, OverflowError):
             pass
         return None, None
+
+    def _cached_value(self, row, index):
+        if row is None or self._active_controllers.get(row[1]) != row[3]:
+            return None, None
+        return self._value_from(self._controller_values, row, index)
+
+    def _proposed_value(self, row, index):
+        raw, number = self._cached_value(row, index)
+        if number is not None:
+            return raw, number, "Live device"
+        for values_db, source in ((self._controller_presets, "Last confirmed settings"),
+                                  (self._controller_defaults, "SD default")):
+            raw, number = self._value_from(values_db, row, index)
+            if number is not None:
+                return raw, number, source
+        return None, None, "Unknown"
 
     @staticmethod
     def _same_device_value(first, second):
@@ -380,23 +433,40 @@ class ActiveTrialSettingsPage(QtWidgets.QWidget):
         row = self._current_row()
         mirror = self._mirror_row() if self.chk_bilateral.isChecked() else None
         for index, spin in enumerate(self._param_editors):
-            raw, number = self._cached_value(row, index)
-            text = raw if raw is not None else "Unknown"
+            raw, _ = self._cached_value(row, index)
+            active = row is not None and self._active_controllers.get(row[1]) == row[3]
+            text = raw if raw is not None else ("Unknown" if active else "Not in use")
+            _, number, source = self._proposed_value(row, index)
             if mirror is not None:
                 mirror_raw, _ = self._cached_value(mirror, index)
-                text = f"Selected: {text}\nMirror: {mirror_raw if mirror_raw is not None else 'Unknown'}"
-            item = self.table.item(index, 1)
-            item.setText(text)
-            item.setToolTip(text)
-            if (index in self._edited_parameters and spin.hasAcceptableInput()
-                    and self._same_device_value(number, spin.value())):
-                self._edited_parameters.discard(index)
-            if index not in self._edited_parameters:
+                mirror_active = self._active_controllers.get(mirror[1]) == mirror[3]
+                mirror_live = mirror_raw if mirror_raw is not None else (
+                    "Unknown" if mirror_active else "Not in use")
+                text = f"Selected: {text}\nOpposite: {mirror_live}"
+                mirror_proposed, _, mirror_source = self._proposed_value(mirror, index)
+                source = (f"Selected: {source}\nOpposite: {mirror_source}"
+                          f" ({mirror_proposed if mirror_proposed is not None else 'unknown'})")
+            self.table.item(index, 1).setText(text)
+            self.table.item(index, 1).setToolTip(text)
+            if index in self._edited_parameters:
+                source = "User edit (both sides)" if mirror is not None else "User edit"
+            else:
                 spin.blockSignals(True)
-                spin.setValue(number if number is not None else 0.0)
+                if number is not None:
+                    spin.setValue(number)
+                else:
+                    spin.setValue(0)
+                    spin.lineEdit().clear()
+                    spin.lineEdit().setPlaceholderText("Enter value")
                 spin.blockSignals(False)
-            spin.setToolTip("Enter a new value. Unknown fields are sent only after editing."
-                            if number is None else "Only changed values are sent.")
+            self.table.item(index, 3).setText(source)
+            self.table.item(index, 3).setToolTip(source)
+            spin.setToolTip(
+                "Explicit edits apply to both sides; untouched opposite-side values are preserved."
+                if mirror is not None else
+                "Switching sends the complete proposed preset; in-use modes send only edited changes."
+            )
+        self.table.resizeRowsToContents()
 
     @QtCore.Slot()
     def _on_apply(self):
@@ -411,28 +481,40 @@ class ActiveTrialSettingsPage(QtWidgets.QWidget):
         if bilateral and mirror is None:
             self.set_param_update_status("Bilateral update requires a matching opposite-side controller schema.")
             return
+        sides = [row, mirror] if mirror is not None else [row]
+        # A timeout does not prevent applying an explicit complete preset.
+        # If the actual mode is unknown, send every field rather than assuming
+        # that a sparse update can reuse unspecified device values.
+        switching = {side[1]: self._active_controllers.get(side[1]) != side[3] for side in sides}
+        edits = {}
+        for index in sorted(self._edited_parameters):
+            spin = self._param_editors[index]
+            if not spin.hasAcceptableInput():
+                self.set_param_update_status(f"Enter a valid value for {row[index + 4]}.")
+                return
+            spin.interpretText()
+            edits[index] = float(spin.value())
         payloads = []
-        for index, spin in enumerate(self._param_editors):
-            _, source_value = self._cached_value(row, index)
-            edited = index in self._edited_parameters
-            if not edited and source_value is None:
-                continue
-            if edited:
-                if not spin.hasAcceptableInput():
-                    self.set_param_update_status(f"Enter a valid value for {row[index + 4]}.")
+        for index in range(len(self._param_editors)):
+            updates = []
+            for side in sides:
+                if not switching[side[1]] and index not in edits:
+                    continue
+                _, proposed, _ = self._proposed_value(side, index)
+                target = edits.get(index, proposed)
+                if target is None:
+                    self.set_param_update_status(
+                        f"Cannot switch {side[0]}: {side[index + 4]} is unknown. "
+                        "Read its settings or enter an explicit value; no zero default is assumed.")
                     return
-                spin.interpretText()
-                target = float(spin.value())
+                _, current = self._cached_value(side, index)
+                if switching[side[1]] or not self._same_device_value(current, target):
+                    updates.append((side, target))
+            if len(updates) == 2 and self._same_device_value(updates[0][1], updates[1][1]):
+                payloads.append([True, int(row[1]), int(row[3]), index, updates[0][1]])
             else:
-                # Keep full cached precision for untouched fields, not spinbox rounding.
-                target = source_value
-            source_changed = not self._same_device_value(source_value, target)
-            mirror_changed = False
-            if mirror is not None:
-                _, mirror_value = self._cached_value(mirror, index)
-                mirror_changed = not self._same_device_value(mirror_value, target)
-            if source_changed or mirror_changed:
-                payloads.append([bilateral, int(row[1]), int(row[3]), index, target])
+                payloads.extend([False, int(side[1]), int(side[3]), index, target]
+                                for side, target in updates)
         if not payloads:
             self.set_param_update_status("No changed properties to apply.", warning=False)
             return

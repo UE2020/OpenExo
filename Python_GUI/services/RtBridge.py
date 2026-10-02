@@ -65,6 +65,7 @@ class RtBridge(QtCore.QObject):
 
         # Handshake payload reassembly state
         self._collecting_handshake_payload = False
+        self._ready_prefix = b""
         
         # Data rate monitoring (verbose console stats; use logging level DEBUG if enabled)
         self.DEBUG_DATA_RATE = False
@@ -157,6 +158,23 @@ class RtBridge(QtCore.QObject):
             return
 
         # Handshake
+        if not self._handshake and (self._ready_prefix or s.startswith("R")):
+            candidate = self._ready_prefix + data
+            if b"READY".startswith(candidate):
+                self._ready_prefix = candidate
+                if len(candidate) < 5:
+                    return
+            elif not candidate.startswith(b"READY"):
+                self._ready_prefix = b""
+            if candidate.startswith(b"READY"):
+                self._ready_prefix = b""
+                self._handshake = True
+                self._collecting_handshake_payload = True
+                self._handshake_payload_buf = ""
+                if len(candidate) > 5:
+                    self._feed_metadata_bytes(candidate[5:])
+                return
+
         if s == "READY":
             self._handshake = True
             # Begin collecting the initial long handshake payload split across notifications
@@ -178,7 +196,7 @@ class RtBridge(QtCore.QObject):
                 self.reset_for_new_ble_session()
                 return
             if "\n" in self._handshake_payload_buf:
-                line, _, _ = self._handshake_payload_buf.partition("\n")
+                line, _, remainder = self._handshake_payload_buf.partition("\n")
                 # Split by commas and drop empty entries
                 tokens = [tok.strip() for tok in line.split(",") if tok.strip()]
                 
@@ -302,6 +320,11 @@ class RtBridge(QtCore.QObject):
                 self._collecting_names = False
                 self._names.clear()
                 self._controllers_done = True
+                if remainder:
+                    self._rx_buffer += remainder.encode("utf-8")
+                    self._drain_frames()
+                    if self._rx_buffer:
+                        self._frame_flush_timer.start(self._frame_flush_ms)
             return
 
         # Parameter names first, plain strings until END
@@ -548,6 +571,8 @@ class RtBridge(QtCore.QObject):
         digits_start = index
         while index < len(buf) and 0x30 <= buf[index] <= 0x39:
             index += 1
+        if index - digits_start > 2:
+            return False
         if index == digits_start:
             return None if index >= len(buf) else False
         if index >= len(buf):
@@ -566,8 +591,25 @@ class RtBridge(QtCore.QObject):
             delimiter = buf.find(b"n", index)
             next_start = buf.find(b"S", index)
             if next_start != -1 and (delimiter == -1 or next_start < delimiter):
-                return False  # A new frame starts before this numeric token ends.
+                # Legacy firmware can drop an ACK's final delimiter at MTU 23.
+                # Continuous telemetry prevents the idle timer from firing;
+                # complete only a numeric final ACK token before the new frame.
+                if command == b"a" and count == 5 and len(tokens) == count - 1:
+                    tail = buf[index:next_start]
+                    try:
+                        valid_tail = (
+                            0 < len(tail) <= self._max_numeric_token_chars
+                            and math.isfinite(float(tail))
+                        )
+                    except ValueError:
+                        valid_tail = False
+                    if valid_tail:
+                        tokens.append(tail)
+                        return next_start, command, count, tokens
+                return False
             if delimiter == -1:
+                if len(buf) - index > self._max_numeric_token_chars:
+                    return False
                 if (
                     allow_unterminated_tail
                     and len(tokens) == count - 1
@@ -576,6 +618,8 @@ class RtBridge(QtCore.QObject):
                     tokens.append(buf[index:])
                     return len(buf), command, count, tokens
                 return None
+            if not 0 < delimiter - index <= self._max_numeric_token_chars:
+                return False
             tokens.append(buf[index:delimiter])
             index = delimiter + 1
         return index, command, count, tokens
@@ -663,6 +707,8 @@ class RtBridge(QtCore.QObject):
         self._rows_38.clear()
         self._collecting_handshake_payload = False
         self._handshake_payload_buf = ""
+        self._ready_prefix = b""
+        self._frame_flush_timer.stop()
         self._rx_buffer = b""
         self._reset_stream()
     

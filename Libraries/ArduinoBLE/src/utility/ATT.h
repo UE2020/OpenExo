@@ -63,6 +63,11 @@ public:
   virtual bool connected(uint8_t addressType, const uint8_t address[6]) const;
   virtual bool connected(uint16_t handle) const;
   virtual uint16_t mtu(uint16_t handle) const;
+  // handleNotify broadcasts to every connected peer; bound chunks and reserve
+  // HCI credits for the same set before starting a nonblocking notification.
+  uint16_t notificationPayloadSize() const;
+  uint8_t notificationPeerCount() const;
+
 
   virtual bool disconnect();
 

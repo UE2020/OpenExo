@@ -95,6 +95,7 @@ def make_bridge():
     bridge = module.RtBridge()
     bridge.paramUpdateAckReceived = Signal()
     bridge.rtDataUpdated = Signal()
+    bridge.liveControllerValuesReceived = Signal()
     # Simulate a completed handshake so live frames take the stream path.
     bridge._handshake = True
     bridge._collecting_names = False
@@ -223,6 +224,66 @@ def test_duplicate_acks_are_all_reported():
 def test_bilateral_out_of_order():
     bridge = feed([RIGHT + LEFT])
     assert acks(bridge) == [RIGHT_ACK, LEFT_ACK]
+
+
+def test_truncated_ack_recovers_during_uninterrupted_telemetry():
+    bridge = feed([LEFT[:-1], RT, RT, RIGHT[:-1], RT])
+    assert acks(bridge) == [LEFT_ACK, RIGHT_ACK]
+    assert [row[:3] for row in rt_frames(bridge)] == [[1.0, 2.0, 3.0]] * 3
+
+
+def test_ready_and_metadata_tail_can_be_fragmented_or_coalesced():
+    preamble = b"READYAnkle(L),65,zeroTorqu,2,use_pid|v,65,2,1|\n"
+    for chunks in ([preamble + RT + LEFT], [preamble[:2], preamble[2:4], preamble[4:] + RT + LEFT]):
+        bridge = module.RtBridge()
+        bridge.rtDataUpdated = Signal()
+        bridge.paramUpdateAckReceived = Signal()
+        bridge.feed_bytes(chunks[0])
+        for chunk in chunks[1:]:
+            bridge.feed_bytes(chunk)
+        assert not bridge._is_metadata_phase()
+        assert acks(bridge) == [LEFT_ACK]
+        assert rt_frames(bridge)[0][:3] == [1.0, 2.0, 3.0]
+
+
+def test_repeated_live_snapshots_and_updates_preserve_every_sample():
+    bridge = make_bridge()
+    expected_rt = []
+    expected_live = []
+    for cycle in range(20):
+        value = cycle / 1000
+        snapshot = f"Sp4c65n2n{value}n-0.125n".encode()
+        telemetry = f"Sd3c{cycle * 100}n200n300n".encode()
+        wire = snapshot + telemetry + LEFT
+        for offset in range(0, len(wire), 19):
+            bridge.feed_bytes(wire[offset:offset + 19])
+        expected_rt.append([float(cycle), 2.0, 3.0])
+        expected_live.append({"joint_id": 65, "controller_id": 2, "values": [value, -.125]})
+    assert [row[:3] for row in rt_frames(bridge)] == expected_rt
+    assert acks(bridge) == [LEFT_ACK] * 20
+    assert [args[0] for args in bridge.liveControllerValuesReceived.events] == expected_live
+
+
+def test_malformed_and_truncated_traffic_cannot_starve_later_frames():
+    for damaged in (
+        b"Sp4c65n2n0.001n",
+        b"Sp4c65n2n" + b"1" * 100,
+        b"Sa" + b"9" * 600,
+        b"Sd3c100nn300n",
+        b"Sa5c6500n200n0n100ninvalid",
+    ):
+        bridge = feed([damaged + RT + LEFT + RT])
+        assert acks(bridge) == [LEFT_ACK], damaged
+        assert [row[:3] for row in rt_frames(bridge)][-2:] == [[1.0, 2.0, 3.0]] * 2, damaged
+
+
+def test_new_session_drops_pending_ready_prefix_and_idle_flush():
+    bridge = module.RtBridge()
+    bridge.rtDataUpdated = Signal()
+    bridge.feed_bytes(b"REA")
+    bridge.reset_for_new_ble_session()
+    bridge.feed_bytes(b"READYAnkle(L),65,zeroTorqu,2,use_pid|\n" + RT)
+    assert rt_frames(bridge)[0][:3] == [1.0, 2.0, 3.0]
 
 
 TESTS = [value for name, value in sorted(globals().items()) if name.startswith("test_")]

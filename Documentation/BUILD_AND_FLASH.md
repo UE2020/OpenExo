@@ -6,6 +6,14 @@ the existing `f`/`a` parameter-update protocol; readback adds BLE `Q`/`p` and UA
 `0x1C`/`0x1D`. Flashing only one board is insufficient. No SD controller-file
 changes are required.
 
+If both boards already run the first controller-editor PR revision, **reflash the
+Nano only** for the readback/telemetry scheduling fixes. The Teensy raw-float
+readback interface is unchanged. Nano builds must use this repository's modified
+`Libraries/ArduinoBLE` (credit preflight and negotiated notification sizing);
+an unmodified ArduinoBLE installation is not interchangeable. Live snapshots,
+ACKs and telemetry now drain an ordered queue without blocking MCU polling for
+per-chunk delays or exhausted notification credits.
+
 With Arduino CLI and the board packages installed, compile from the repository root:
 
 ```sh
@@ -15,10 +23,13 @@ arduino-cli compile --fqbn arduino:mbed_nano:nano33ble --libraries Libraries Exo
 ```
 
 The SD library is needed by the shared firmware headers when compiling the Nano.
-Follow the flashing steps below for each board. Hardware validation should check
-live readback after startup, a multi-property Apply (including both sides), and a
-recorded CSV with small PID gains; builds and host smoke runs do not prove delivery
-over the physical BLE/UART links.
+Follow the flashing steps below for each required board. Hardware validation must
+check first-connect readback without restarting the GUI, repeated zeroTorque/PJMC
+roundtrips, multi-property Apply (including both sides), and continuously advancing
+torque plots and CSV telemetry throughout Apply/readback. Check small PID gains
+and that inactive/unconfirmed CSV settings stay blank. Builds and host/native
+smoke runs do not prove delivery over the physical BLE/UART links; validate this
+on hardware before study use.
 
 ## Downloads
 1. Download Arduino IDE 1.8.19, which can be found [here](https://www.arduino.cc/en/software) or [here](https://drive.google.com/drive/folders/1IRxJFNm2gxUtCeU8Dcavg_Mv2ubANOHK?usp=drive_link)

@@ -119,6 +119,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._controller_matrix = []
         # Store controller values by (joint_id, controller_id)
         self._controller_values = {}
+        self._controller_presets = {}
+        self._controller_defaults = {}
+        self._connection_ready = False
+        self._controller_catalog_ready = False
         self._pending_param_updates = {}
         self._pending_param_update_seq = 0
         self._controller_batch = deque()
@@ -212,6 +216,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # new link can arrive.
             self.rt_bridge.reset_for_new_ble_session()
             self._clear_pending_param_updates("new connection requested")
+            self._destroy_controller_db()
         except Exception as e:
             self.logger.error(f"Failed to reset RtBridge before connect: {e}")
             self.logger.debug(traceback.format_exc())
@@ -382,25 +387,44 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(list)
     def _on_controller_values(self, rows):
-        # Legacy v rows contain SD-file defaults, not the live MCU parameters.
-        # They cannot establish the settings used by a trial.
-        self._controller_values = self._normalized_controller_values({})
-        self.settings_page.set_controller_values(self._controller_values)
+        # Catalog v rows are usable SD presets, not evidence of active settings.
+        defaults = {}
+        for row in rows:
+            if len(row) >= 2:
+                defaults[(str(row[0]), str(row[1]))] = list(row[2:])
+        self._controller_defaults = self._normalized_controller_values(defaults)
+        self._controller_catalog_ready = True
+        self._sync_controller_editor()
         self._request_controller_values()
 
+    def _sync_controller_editor(self):
+        self.settings_page.set_controller_presets(
+            self._controller_presets, self._controller_defaults
+        )
+        live_values = {
+            key: values for key, values in self._controller_values.items()
+            if key[0] in self._confirmed_controller_joints
+            and self._active_controllers.get(key[0]) == key[1]
+        }
+        self.settings_page.set_controller_values(live_values)
+        self.settings_page.set_active_controllers({
+            joint: controller for joint, controller in self._active_controllers.items()
+            if joint in self._confirmed_controller_joints
+        })
+
     def _request_controller_values(self):
-        if self._trial_starting or self._controller_readback_joint is not None or self._pending_param_updates:
+        if (not self._connection_ready or not self._controller_catalog_ready
+                or self._trial_starting or self._controller_readback_joint is not None
+                or self._pending_param_updates):
             return
         joints = list(dict.fromkeys(
             str(row[1]) for row in self._controller_matrix if len(row) >= 4
         ))
         self._controller_readback_queue = deque(joints)
         self._confirmed_controller_joints.difference_update(joints)
-        for key, values in self._controller_values.items():
-            if key[0] in joints:
-                self._controller_values[key] = [None] * len(values)
-        self.settings_page.set_controller_values(self._controller_values)
-        self.settings_page.set_active_controllers({})
+        # Invalidate CSV confirmation while refreshing, but retain reusable mode
+        # presets. Refreshing truth must not erase the operator's configuration.
+        self._sync_controller_editor()
         self._send_next_controller_readback()
 
     def _send_next_controller_readback(self):
@@ -424,7 +448,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._controller_readback_joint != joint_id or self._controller_readback_token != token:
             return
         self._show_param_update_status(
-            f"Live settings unavailable for joint {joint_id}; readback firmware is required. CSV values remain unknown.",
+            f"No live settings reply for joint {joint_id}. Settings remain unconfirmed; plotting and recording remain enabled.",
             warning=True,
         )
         self._send_next_controller_readback()
@@ -445,17 +469,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._active_controllers[joint_id] = controller_id
         self._controller_values[(joint_id, controller_id)] = [str(value) for value in values]
-        # Inactive controllers reload defaults on selection; previously used
-        # values must not seed a later edit as though they were still in use.
-        for key in list(self._controller_values):
-            if key[0] == joint_id and key[1] != controller_id:
-                self._controller_values[key] = [None] * len(self._controller_values[key])
+        self._controller_presets[(joint_id, controller_id)] = [str(value) for value in values]
         self._confirmed_controller_joints.add(joint_id)
-        self.settings_page.set_controller_values(self._controller_values)
-        self.settings_page.set_active_controllers({
-            joint: controller for joint, controller in self._active_controllers.items()
-            if joint in self._confirmed_controller_joints
-        })
+        self._sync_controller_editor()
         self._send_next_controller_readback()
 
     def _build_controller_csv_columns(self):
@@ -566,7 +582,7 @@ class MainWindow(QtWidgets.QMainWindow):
             values.append(None)
         values[int(param_index)] = None if value is None else str(value)
         self._controller_values[key] = values
-        self.settings_page.set_controller_values(self._controller_values)
+        self._sync_controller_editor()
 
     def _show_param_update_status(self, message: str, warning: bool = True):
         try:
@@ -877,7 +893,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if has_matrix:
             try:
                 self.settings_page.set_controller_matrix(self._controller_matrix)
-                self.settings_page.set_controller_values(self._controller_values)
+                self._sync_controller_editor()
             except Exception as e:
                 self.logger.error(f"Failed to set controller matrix in settings: {e}")
                 self.logger.debug(traceback.format_exc())
@@ -941,7 +957,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._controller_batch_applied = 0
         self._confirmed_controller_joints.difference_update(str(update[0]) for update in updates)
         self.settings_page.set_update_pending(True)
-        self._send_next_controller_update()
+        if self._send_next_controller_update():
+            # Applying settings must return to the live study surface without
+            # clearing plots, pausing motors, or interrupting CSV recording.
+            self.stack.setCurrentWidget(self.trial_page)
 
     def _send_next_controller_update(self):
         if not self._controller_batch:
@@ -965,6 +984,7 @@ class MainWindow(QtWidgets.QMainWindow):
             f"Applying controller properties: {self._controller_batch_applied}/{self._controller_batch_total}",
             warning=False,
         )
+        return True
 
     def _finish_controller_batch(self, error=None):
         self._controller_batch.clear()
@@ -998,6 +1018,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._clear_ble_prefs_on_new_connection()
         self._clear_pending_param_updates("controller database cleared")
         try:
+            self._connection_ready = False
+            self._controller_catalog_ready = False
+            self._controller_presets.clear()
+            self._controller_defaults.clear()
             self._controller_matrix = []
             self._controller_values = {}
             self._active_controllers.clear()
@@ -1005,6 +1029,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._trial_starting = False
             self.settings_page.set_controller_matrix([])
             self.settings_page.set_controller_values({})
+            self.settings_page.set_controller_presets({}, {})
         except Exception as e:
             self.logger.error(f"Failed to destroy controller DB: {e}")
             self.logger.debug(traceback.format_exc())
@@ -1037,6 +1062,7 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.Slot(str, str)
     def _on_dev_connected(self, name: str, addr: str):
         self.logger.info(f"Device connected: {name} {addr}")
+        self._connection_ready = True
         # Clear stale **saved** prefs only; do not wipe handshake matrix (handshake can
         # arrive before this slot — _destroy_controller_db would erase it → Basic-only UI).
         try:
@@ -1079,7 +1105,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             if self._controller_matrix:
                 self.settings_page.set_controller_matrix(self._controller_matrix)
-                self.settings_page.set_controller_values(self._controller_values)
+                self._sync_controller_editor()
                 self._request_controller_values()
         except Exception as e:
             self.logger.error(f"Failed to sync settings page after connect: {e}")

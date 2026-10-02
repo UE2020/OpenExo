@@ -123,6 +123,7 @@ class IsolatedQtTest(unittest.TestCase):
         page = ActiveTrialSettingsPage()
         self.widgets.append(page)
         page.set_controller_matrix(MATRIX)
+        page.set_active_controllers({"65": "2", "33": "2"})
         return page
 
     def window(self):
@@ -134,6 +135,7 @@ class IsolatedQtTest(unittest.TestCase):
         self.widgets.append(window)
         self.addCleanup(window._stop_recording)
         window._on_controller_matrix(MATRIX)
+        window.qt_dev.connected.emit("Test device", "test")
         bridge = window.rt_bridge
         bridge._handshake = True
         bridge._collecting_names = False
@@ -151,9 +153,9 @@ class IsolatedQtTest(unittest.TestCase):
         self.readback(window)
         return window
 
-    def ack(self, window, joint=65, index=0, accepted=True, reason=0):
+    def ack(self, window, joint=65, index=0, accepted=True, reason=0, controller=2):
         window.rt_bridge.feed_bytes(
-            (f"Sa5c{joint * 100}n200n{index * 100}n{100 if accepted else 0}n{reason * 100}n").encode()
+            (f"Sa5c{joint * 100}n{controller * 100}n{index * 100}n{100 if accepted else 0}n{reason * 100}n").encode()
         )
 
 
@@ -173,7 +175,7 @@ class EditorTests(IsolatedQtTest):
         self.assertEqual([editor.value() for editor in page._param_editors], [1, .01, .5])
         self.assertNotIn("last_value", SettingsManager.load_settings())
 
-    def test_bilateral_differences_are_not_hidden_by_selected_side(self):
+    def test_bilateral_untouched_differences_remain_and_explicit_edits_affect_both(self):
         page = self.page()
         page.set_controller_values({("65", "2"): [1, .01, .5], ("33", "2"): [2, .01, .8]})
         emitted = []
@@ -182,7 +184,13 @@ class EditorTests(IsolatedQtTest):
         self.assertIn("2", page.table.item(0, 1).text())
         self.assertIn("1", page.table.item(0, 1).text())
         page.btn_apply.click()
-        self.assertEqual(emitted, [[[True, 65, 2, 0, 1.0], [True, 65, 2, 2, .5]]])
+        self.assertEqual(emitted, [])
+        page._param_editors[0].setValue(3)
+        page.btn_apply.click()
+        self.assertEqual(emitted, [[[True, 65, 2, 0, 3.0]]])
+        page._param_editors[2].lineEdit().textEdited.emit("0.5")
+        page.btn_apply.click()
+        self.assertEqual(emitted[-1], [[True, 65, 2, 0, 3.0], [False, 33, 2, 2, .5]])
 
     def test_unknown_properties_require_explicit_edit_including_zero(self):
         page = self.page()
@@ -192,9 +200,191 @@ class EditorTests(IsolatedQtTest):
         page._param_editors[0].setValue(4)
         page.btn_apply.click()
         self.assertEqual(emitted[-1], [[False, 65, 2, 0, 4.0]])
+        page._param_editors[1].lineEdit().setText("0")
         page._param_editors[1].lineEdit().textEdited.emit("0")
         page.btn_apply.click()
         self.assertEqual(emitted[-1], [[False, 65, 2, 0, 4.0], [False, 65, 2, 1, 0.0]])
+
+
+class ModePresetEditorTests(IsolatedQtTest):
+    ZERO_FIELDS = ["use_pid", "p_gain", "i_gain", "d_gain"]
+    PJMC_FIELDS = ["stance_max", "swing_max", "is_assistance", "use_pid", "p_gain",
+                   "i_gain", "d_gain", "torque_alpha", "GS_Flag", "kp_zero",
+                   "ki_zero", "kd_zero"]
+    ZERO = [1, 6.5, .1, .4]
+    PJMC = [25, 3, 1, 1, 8, .01, .3, .2, 0, 2, .02, .1]
+
+    def mode_page(self):
+        page = ActiveTrialSettingsPage()
+        self.widgets.append(page)
+        matrix = [
+            [name, joint, controller, cid, *fields]
+            for name, joint in (("Ankle(L)", "65"), ("Ankle(R)", "33"))
+            for controller, cid, fields in (("zeroTorqu", "2", self.ZERO_FIELDS),
+                                           ("PJMC", "3", self.PJMC_FIELDS))
+        ]
+        page._last_selection.update(joint="65", controller="2")
+        page.set_controller_matrix(matrix)
+        page.set_active_controllers({"65": "2", "33": "2"})
+        page.set_controller_values({("65", "2"): self.ZERO, ("33", "2"): self.ZERO})
+        defaults = {(joint, "3"): self.PJMC for joint in ("65", "33")}
+        page.set_controller_presets({("65", "2"): self.ZERO, ("33", "2"): self.ZERO}, defaults)
+        emitted = []
+        page.applyRequested.connect(emitted.append)
+        return page, emitted, matrix, defaults
+
+    def select_mode(self, page, name):
+        page.combo_controller.setCurrentIndex(page.combo_controller.findText(name))
+
+    def values(self, page):
+        return [editor.value() for editor in page._param_editors]
+
+    def test_initial_pjmc_uses_complete_sd_preset_without_arbitrary_edit(self):
+        page, emitted, _, _ = self.mode_page()
+        self.select_mode(page, "PJMC")
+        self.assertEqual(self.values(page), self.PJMC)
+        page._param_editors[1].setValue(4)
+        page.btn_apply.click()
+        expected = list(self.PJMC)
+        expected[1] = 4
+        self.assertEqual(emitted, [[[False, 65, 3, i, value]
+                                    for i, value in enumerate(expected)]])
+        page.set_controller_matrix(page._controller_matrix)
+        page.btn_apply.click()
+        self.assertEqual(emitted[-1], [[False, 65, 3, i, value]
+                                      for i, value in enumerate(self.PJMC)])
+
+    def test_mode_roundtrip_uses_last_confirmed_not_sd_or_inactive_live_cache(self):
+        page, emitted, _, defaults = self.mode_page()
+        self.select_mode(page, "PJMC")
+        used = list(self.PJMC)
+        used[0], used[4] = 31, 9.25
+        presets = {("65", "2"): self.ZERO, ("65", "3"): used}
+        page.set_controller_presets(presets, defaults)
+        page.set_active_controllers({"65": "3", "33": "2"})
+        page.set_controller_values({("65", "3"): used})
+        self.select_mode(page, "zeroTorqu")
+        self.assertEqual(self.values(page), self.ZERO)
+        page.btn_apply.click()
+        self.assertEqual(emitted[-1], [[False, 65, 2, i, value]
+                                      for i, value in enumerate(self.ZERO)])
+        page.set_active_controllers({"65": "2", "33": "2"})
+        page.set_controller_values({("65", "2"): self.ZERO, ("65", "3"): [999] * 12})
+        self.select_mode(page, "PJMC")
+        self.assertEqual(self.values(page), used)
+        page.btn_apply.click()
+        self.assertEqual(emitted[-1], [[False, 65, 3, i, value] for i, value in enumerate(used)])
+        self.select_mode(page, "zeroTorqu")
+        self.assertEqual(self.values(page), self.ZERO)
+
+    def test_live_refresh_preserves_dirty_fields_and_saved_preset_is_not_live(self):
+        page, emitted, _, defaults = self.mode_page()
+        page._param_editors[1].setValue(7)
+        fresh = [1, 6.75, .15, .45]
+        page.set_controller_values({("65", "2"): fresh})
+        page.set_controller_presets({("65", "2"): fresh}, defaults)
+        self.assertEqual(self.values(page), [1, 7, .15, .45])
+        self.assertEqual(page.table.item(1, 1).text(), "6.75")
+        page.btn_apply.click()
+        self.assertEqual(emitted[-1], [[False, 65, 2, 1, 7.0]])
+        page.set_controller_values({})
+        self.assertEqual(self.values(page), [1, 7, .15, .45])
+
+    def test_cancelled_or_failed_apply_and_reopening_do_not_replace_confirmed_preset(self):
+        page, emitted, matrix, defaults = self.mode_page()
+        presets = {("65", "2"): self.ZERO, ("65", "3"): self.PJMC}
+        page.set_controller_presets(presets, defaults)
+        self.select_mode(page, "PJMC")
+        page._param_editors[0].setValue(40)
+        page.btn_apply.click()
+        page.set_update_pending(True)
+        page.set_param_update_status("Device rejected update.")
+        page.set_update_pending(False)
+        page.btn_cancel.click()
+        page.set_controller_matrix(matrix)
+        self.assertEqual(self.values(page), self.PJMC)
+        page.btn_apply.click()
+        self.assertEqual(emitted[-1], [[False, 65, 3, i, value]
+                                      for i, value in enumerate(self.PJMC)])
+
+    def test_unknown_switch_value_blocks_entire_batch_until_explicitly_entered(self):
+        page, emitted, _, defaults = self.mode_page()
+        defaults[("65", "3")] = [*self.PJMC[:-1], None]
+        page.set_controller_presets({}, defaults)
+        self.select_mode(page, "PJMC")
+        self.assertEqual(page._param_editors[-1].lineEdit().text(), "")
+        page.btn_apply.click()
+        self.assertEqual(emitted, [])
+        editor = page._param_editors[-1]
+        editor.lineEdit().setText("0")
+        editor.lineEdit().textEdited.emit("0")
+        page.btn_apply.click()
+        expected = [*self.PJMC[:-1], 0]
+        self.assertEqual(emitted[-1], [[False, 65, 3, i, value]
+                                      for i, value in enumerate(expected)])
+
+    def test_bilateral_switch_only_inactive_side_preserves_other_side_live_values(self):
+        page, emitted, _, _ = self.mode_page()
+        opposite = list(self.PJMC)
+        opposite[0] = 41
+        page.set_active_controllers({"65": "2", "33": "3"})
+        page.set_controller_values({("65", "2"): self.ZERO, ("33", "3"): opposite})
+        self.select_mode(page, "PJMC")
+        page.chk_bilateral.setChecked(True)
+        page.btn_apply.click()
+        self.assertEqual(emitted[-1], [[False, 65, 3, i, value]
+                                      for i, value in enumerate(self.PJMC)])
+        page._param_editors[0].setValue(30)
+        page.btn_apply.click()
+        self.assertEqual(emitted[-1], [[True, 65, 3, 0, 30.0],
+                                      *[[False, 65, 3, i, self.PJMC[i]]
+                                        for i in range(1, len(self.PJMC))]])
+
+    def test_bilateral_switch_preserves_distinct_side_presets_and_rejects_unknown_side(self):
+        page, emitted, _, defaults = self.mode_page()
+        right = list(self.PJMC)
+        right[0] = 40
+        defaults[("33", "3")] = right
+        page.set_controller_presets({}, defaults)
+        self.select_mode(page, "PJMC")
+        page.chk_bilateral.setChecked(True)
+        page.btn_apply.click()
+        self.assertEqual(emitted[-1], [[False, 65, 3, 0, 25], [False, 33, 3, 0, 40],
+                                      *[[True, 65, 3, i, self.PJMC[i]]
+                                        for i in range(1, len(self.PJMC))]])
+        defaults[("33", "3")] = [*right[:-1], None]
+        page.set_controller_presets({}, defaults)
+        page.btn_apply.click()
+        self.assertEqual(len(emitted), 1)
+
+    def test_bilateral_schema_mismatch_is_not_a_matching_joint(self):
+        page, emitted, matrix, _ = self.mode_page()
+        matrix[-1] = [*matrix[-1][:-1], "other_property"]
+        page.set_controller_matrix(matrix)
+        self.select_mode(page, "PJMC")
+        self.assertFalse(page.chk_bilateral.isEnabled())
+        page.chk_bilateral.setChecked(True)
+        page.btn_apply.click()
+        self.assertEqual(emitted, [])
+
+    def test_unknown_active_mode_requires_full_explicit_preset_not_sparse_guess(self):
+        page, emitted, _, _ = self.mode_page()
+        page.set_active_controllers({})
+        self.select_mode(page, "PJMC")
+        page._param_editors[0].setValue(30)
+        page.btn_apply.click()
+        expected = [30, *self.PJMC[1:]]
+        self.assertEqual(emitted, [[[False, 65, 3, i, value]
+                                    for i, value in enumerate(expected)]])
+
+    def test_untouched_switch_values_keep_confirmed_precision_not_spinbox_rounding(self):
+        page, emitted, _, defaults = self.mode_page()
+        confirmed = [*self.PJMC]
+        confirmed[4] = "9.250000001"
+        page.set_controller_presets({("65", "3"): confirmed}, defaults)
+        self.select_mode(page, "PJMC")
+        page.btn_apply.click()
+        self.assertEqual(emitted[-1][4], [False, 65, 3, 4, 9.250000001])
 
 
 class BatchTests(IsolatedQtTest):
@@ -389,6 +579,108 @@ class SnapshotParserTests(IsolatedQtTest):
         for frame in (b"Sp1c65n", b"Sp3c65.5n2n1n", b"Sp3c65n2.5n1n", b"Sp3c65n2nNaNn", b"Sp3c65n2nInfn", b"Sp3c65n2ninvalidn"):
             with self.subTest(frame=frame):
                 self.assertEqual(self.feed([frame], flush=True), ([], [], []))
+
+
+class ReadbackLifecycleTests(IsolatedQtTest):
+    def test_catalog_and_connection_can_arrive_in_either_order(self):
+        for metadata_first in (True, False):
+            with self.subTest(metadata_first=metadata_first):
+                window = self.window()
+                window._destroy_controller_db()
+                window._on_controller_matrix(MATRIX)
+                defaults = [["65", "2", "9", "8", "7"], ["65", "3", "6"]]
+                if metadata_first:
+                    window._on_controller_values(defaults)
+                    self.assertEqual(window.qt_dev.queries, [])
+                    window.qt_dev.connected.emit("Test device", "test")
+                else:
+                    window.qt_dev.connected.emit("Test device", "test")
+                    self.assertEqual(window.qt_dev.queries, [])
+                    window._on_controller_values(defaults)
+                self.assertEqual(window.qt_dev.queries, [65])
+                self.readback(window)
+                self.assertEqual(window._confirmed_controller_joints, {"65", "33"})
+                self.assertEqual([spin.value() for spin in window.settings_page._param_editors],
+                                 [1, .01, .5])
+
+    def test_new_device_cannot_inherit_previous_device_mode_presets(self):
+        window = self.acknowledged_window()
+        window._request_controller_values()
+        self.readback(window, left=(3, [7]))
+        window._on_dev_disconnected()
+        window._on_controller_matrix(MATRIX)
+        window._on_controller_values([["65", "2", "9", "8", "7"], ["65", "3", "11"]])
+        window.qt_dev.connected.emit("Different exo", "different")
+        self.readback(window, left=(2, [9, 8, 7]), right=(2, [4, 5, 6]))
+        window._on_update_controller()
+        self.readback(window, left=(2, [9, 8, 7]), right=(2, [4, 5, 6]))
+        page = window.settings_page
+        self.assertEqual([spin.value() for spin in page._param_editors], [9, 8, 7])
+        page.combo_controller.setCurrentIndex(page.combo_controller.findText("Constant"))
+        self.assertEqual(page._param_editors[0].value(), 11)
+        with self.assertRaises(ValueError):
+            float(page.table.item(0, 1).text())
+
+    def test_refresh_and_mode_roundtrip_preserve_presets_not_csv_truth(self):
+        window = self.acknowledged_window()
+        window._controller_defaults[("65", "3")] = ["7"]
+        window._on_update_controller()
+        self.readback(window)
+        page = window.settings_page
+        page.combo_controller.setCurrentIndex(page.combo_controller.findText("Constant"))
+        self.assertEqual(page._param_editors[0].value(), 7)
+        page.btn_apply.click()
+        self.assertIs(window.stack.currentWidget(), window.trial_page)
+        self.ack(window, controller=3)
+        self.readback(window, left=(3, [7]))
+        window._on_update_controller()
+        self.readback(window, left=(3, [7]))
+        page.combo_controller.setCurrentIndex(page.combo_controller.findText("PID"))
+        self.assertEqual([spin.value() for spin in page._param_editors], [1, .01, .5])
+        self.assertNotIn("999", [spin.lineEdit().text() for spin in page._param_editors])
+        page.btn_apply.click()
+        for index in range(3):
+            self.ack(window, index=index)
+        self.readback(window)
+        self.assertEqual(window._controller_presets[("65", "3")], ["7.0"])
+        self.assertEqual([float(value) for value in window._controller_presets[("65", "2")]],
+                         [1, .01, .5])
+        window._csv_controller_columns = window._build_controller_csv_columns()
+        csv_values = dict(zip([column[0] for column in window._csv_controller_columns],
+                              window._controller_csv_values()))
+        self.assertEqual(csv_values["controller_65_3_0_torque"], "")
+        self.assertEqual(float(csv_values["controller_65_2_1_ki"]), .01)
+
+    def test_query_timeout_preserves_graph_recording_and_complete_mode_presets(self):
+        window = self.acknowledged_window()
+        window._controller_defaults[("65", "3")] = ["7"]
+        with patch.object(window_module, "__file__", str(self.base / "MainWindow.py")):
+            window._start_csv_auto("timeout_continuity")
+        path = Path(window._csv_path_last)
+        for joint in ("65", "33"):
+            window._on_controller_readback_timeout(joint, window._controller_readback_token)
+        page = window.settings_page
+        page.combo_controller.setCurrentIndex(page.combo_controller.findText("Constant"))
+        self.assertEqual(page._param_editors[0].value(), 7)
+        page.btn_apply.click()
+        self.assertIs(window.stack.currentWidget(), window.trial_page)
+        frames = [b"Sd4c100n1100n2100n3100n",
+                  b"Sd4c200n1200n2200n3200n",
+                  b"Sd4c300n1300n2300n3300n"]
+        window.rt_bridge.feed_bytes(frames[0])
+        self.ack(window, controller=3)
+        window.rt_bridge.feed_bytes(frames[1])
+        self.readback(window, left=(3, [7]))
+        window.rt_bridge.feed_bytes(frames[2])
+        self.assertEqual(list(window.trial_page.top_meas_vals), [11, 12, 13])
+        self.assertEqual(list(window.trial_page.curve_top_meas.getData()[1]), [11, 12, 13])
+        window._stop_recording()
+        with path.open(newline="") as stream:
+            records = list(csv.DictReader(stream))
+        self.assertEqual([float(record["data0"]) for record in records], [1, 2, 3])
+        self.assertEqual([record["controller_65_status"] for record in records],
+                         ["updating", "unknown", "confirmed"])
+        self.assertEqual(float(records[-1]["controller_65_3_0_torque"]), 7)
 
 
 if __name__ == "__main__":

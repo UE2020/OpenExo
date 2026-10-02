@@ -510,6 +510,33 @@ BLEDevice ATTClass::central()
   return BLEDevice();
 }
 
+uint16_t ATTClass::notificationPayloadSize() const
+{
+  uint16_t payload = 0;
+  for (int i = 0; i < ATT_MAX_PEERS; i++) {
+    if (_peers[i].connectionHandle == 0xffff) {
+      continue;
+    }
+    const uint16_t peerPayload = _peers[i].mtu > 3 ? _peers[i].mtu - 3 : 0;
+    if (!peerPayload) {
+      return 0;
+    }
+    payload = payload ? min(payload, peerPayload) : peerPayload;
+  }
+  return payload;
+}
+
+uint8_t ATTClass::notificationPeerCount() const
+{
+  uint8_t count = 0;
+  for (int i = 0; i < ATT_MAX_PEERS; i++) {
+    if (_peers[i].connectionHandle != 0xffff) {
+      count++;
+    }
+  }
+  return count;
+}
+
 bool ATTClass::handleNotify(uint16_t handle, const uint8_t* value, int length)
 {
   int numNotifications = 0;

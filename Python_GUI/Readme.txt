@@ -7,20 +7,29 @@
 Controller settings
 -------------------
 The Update Controller page shows every property for the selected joint/controller,
-the device's current value, and an editable new value. The in-use controller is
-shown above the table. Reopening the page requests fresh settings; saved attempted
-values are never restored as device values. Only the joint/controller selection
-and bilateral checkbox are remembered.
+live device values, editable proposed values, and each proposal's source. The
+in-use controller is shown above the table. Proposals use current live settings,
+then the last fully confirmed settings for that mode, then its SD-file defaults.
+Switching zeroTorque -> PJMC -> zeroTorque restores the original confirmed preset;
+unused modes start with their SD preset instead of invented zeros. Presets last
+for the current device connection and are cleared on disconnect/device change.
+Reopening requests fresh live values without erasing those presets. Saved attempted
+edits never become device truth; only selection and bilateral preference persist.
 
 Edit multiple properties and press Apply once. The GUI sends the existing
 single-property firmware command sequentially, waiting for each acknowledgement.
 This is not an atomic transaction: a rejection or timeout stops remaining changes,
 but already accepted changes stay applied. The status reports partial completion.
 Pause the exo before changing settings if intermediate configurations are unsafe.
-Bilateral mode shows both sides' values and requires matching controller metadata;
-it applies the selected side's new values to both sides, including existing differences.
-Unknown fields are not sent until explicitly edited. Controllers not currently in
-use have unknown properties until selected/applied and read back from the device.
+Bilateral mode requires matching controller metadata and displays both sides.
+Explicit edits affect both sides; untouched fields preserve each side's own values.
+Switching modes sends the complete preset, even if no field was manually edited;
+an already in-use mode receives only explicit edits. Missing preset fields must
+be entered before switching. Unknown fields are blank, never fabricated zeros.
+After Apply, the GUI returns to the trial plots without stopping recording or
+clearing the graphs. Readback waits for both connection and catalog readiness.
+A timeout marks live settings unconfirmed; it does not diagnose missing firmware
+or disable plotting/recording. Complete presets remain usable after a timeout.
 Without a controller catalog, the existing raw-ID Basic page remains available.
 
 Recording CSV
@@ -48,15 +57,24 @@ fresh readback (open Update Controller).
 
 Firmware requirement
 --------------------
-Flash both the Teensy and Nano firmware from this revision for live settings.
-Bulk editing itself uses the existing f command and its a acknowledgement. Accurate
-readback adds Q (joint query), p (unscaled float32 snapshot), and UART commands
-0x1C/0x1D. The existing handshake v rows are SD defaults, not live controller state.
-The new UART reply preserves small PID gains and large parameter values instead
-of using the telemetry fixed-point encoding. Long replies use 19-byte BLE chunks.
-Older firmware can still accept parameter changes, but readback will time out and
-CSV settings remain unknown. See Documentation/BUILD_AND_FLASH.md.
+Live readback initially requires both Teensy and Nano firmware from this branch.
+If both were flashed from the first controller-editor PR revision, only the Nano
+needs reflashing for the communication fixes. Build with the repository's bundled
+ArduinoBLE library, not an unmodified separately installed copy.
+Bulk editing uses the existing f command and a acknowledgement. Readback adds Q
+(joint query), p (unscaled float32 snapshot), and UART commands 0x1C/0x1D. Handshake
+v rows are SD defaults, not live state. Small PID gains and large values retain
+float32 precision. Live replies, ACKs and telemetry use an ordered FIFO and
+negotiated-MTU chunks without the former blocking per-chunk delays. Exhausted BLE
+credits defer sends while MCU polling continues; full queues report an error
+instead of overwriting queued samples. A failed/congested link can still prevent
+delivery. Older firmware can accept edits, but readback may time out and CSV
+settings remain unknown. See Documentation/BUILD_AND_FLASH.md.
 
 Hardware-free regression commands (run from the repository root):
   python tests/test_controller_settings.py
   python tests/test_ack_parser.py
+With g++ installed, the native queue regression can also be run from Windows cmd:
+  g++ -std=c++11 tests/test_ble_tx_queue.cpp -o "%TEMP%/openexo-ble-tx-smoke.exe" && "%TEMP%/openexo-ble-tx-smoke.exe"
+These checks use no physical exo; validate continuous torque plots and recording
+through repeated mode switches on hardware before using this revision in a study.

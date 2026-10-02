@@ -63,6 +63,9 @@ public:
                   uint16_t latency, uint16_t supervisionTimeout);
   virtual int leCancelConn();
 
+  // Let nonblocking callers defer a notification rather than spin in sendAclPkt.
+  bool canSendAclPkt(uint8_t packets = 1) const;
+
 
   virtual int sendAclPkt(uint16_t handle, uint8_t cid, uint8_t plen, void* data);
 

@@ -11,6 +11,8 @@
 #include "uart_commands.h"
 #include <math.h>
 #include <stdio.h>
+#include <utility/ATT.h>
+#include <utility/HCI.h>
 
 #define EXOBLE_DEBUG 0
 
@@ -273,50 +275,25 @@ bool ExoBLE::handle_updates()
         BLE.poll();
         int32_t current_status = BLE.connected();
 
-        if (_connected == current_status)
+        if (_connected != current_status)
         {
-            #if EXOBLE_DEBUG
-                logger::print("ExoBLE::handle_updates:queue size:");
-                logger::print(ble_queue::size());
-                logger::print("\n");
-            #endif
 
-            return ble_queue::size();
-        }
-
-        // A command fragment can never cross a BLE connection boundary.
-        ble_rx::reset_parser();
-
-        //The BLE connection status changed
-        if (current_status < _connected)
-        {
-            //Disconnection
-            ble_queue::clear();
-            _tx_subscribed = false;
+            // A command fragment can never cross a BLE connection boundary.
+            ble_rx::reset_parser();
+            _tx_queue.clear();
             _handshake_sent_this_connection = false;
             _handshake_payload_pending = true;
-            #if EXOBLE_DEBUG
-                logger::print("Disconnection");
-                logger::print("\n");
-            #endif
-        }
-        else if (current_status > _connected)
-        {
-            //Connection
-            #if EXOBLE_DEBUG
-                logger::print("Connection");
-                logger::print("\n");
-            #endif
 
-            // Mark connected; wait for TX subscribe before sending handshake.
+            if (current_status < _connected)
+            {
+                ble_queue::clear();
+            }
+            advertising_onoff(current_status == 0);
             _connected = current_status;
-            _tx_subscribed = false;
-            _handshake_sent_this_connection = false;
-            _handshake_payload_pending = true;
         }
-
-        advertising_onoff(current_status == 0);
-        _connected = current_status;
+        // BLE.poll can dispatch subscribe before the main loop observes the
+        // connection. Do not overwrite that event with a false subscription.
+        _tx_subscribed = current_status > 0 && _gatt_db.TXChar.subscribed();
     }
 
     if (_connected > 0 &&
@@ -331,6 +308,8 @@ bool ExoBLE::handle_updates()
             _handshake_payload_pending = false;
         }
     }
+    _flush_tx_queue();
+
 
     #if EXOBLE_DEBUG
         logger::print("ExoBLE::handle_updates:queue size:");
@@ -343,19 +322,24 @@ bool ExoBLE::handle_updates()
 
 bool ExoBLE::send_message(BleMessage &msg)
 {
-    if (!this->_connected)
+    if (!this->_connected || !_tx_subscribed || !_gatt_db.TXChar.subscribed())
     {
-        return false; /* Don't bother sending anything if no one is listening */
+        return false;
     }
 
     #if EXOBLE_DEBUG
         BleMessage::print(msg);
     #endif
 
-    byte buffer[BleParser::MAX_SERIALIZED_BYTES] = {0};
+    uint8_t* buffer = _tx_queue.writable_data();
+    if (buffer == nullptr)
+    {
+        logger::println("ExoBLE::send_message transmission queue full", LogLevel::Error);
+        return false;
+    }
     const int bytes_to_send = _ble_parser.package_raw_data(
         buffer,
-        sizeof(buffer),
+        BleTxQueue::MAX_FRAME_BYTES,
         msg);
     if (bytes_to_send <= 0)
     {
@@ -363,17 +347,25 @@ bool ExoBLE::send_message(BleMessage &msg)
         return false;
     }
 
-    // The minimum ATT payload is MTU-3 = 20 bytes until the central negotiates
-    // a larger MTU, so longer frames are truncated on the wire. The host parser
-    // tolerates a frame whose trailing delimiter is dropped; report when the
-    // notification reaches no subscribed peer so lost ACKs are not silent.
-    const int delivered = _gatt_db.TXChar.writeValue(buffer, bytes_to_send);
-    if (delivered <= 0)
+    return _tx_queue.commit(bytes_to_send);
+}
+
+void ExoBLE::_flush_tx_queue()
+{
+    if (!_connected || !_tx_subscribed || !_handshake_sent_this_connection ||
+        !_gatt_db.TXChar.subscribed())
     {
-        logger::println("ExoBLE::send_message notification not delivered", LogLevel::Warn);
-        return false;
+        return;
     }
-    return true;
+    const uint16_t payload = ATT.notificationPayloadSize();
+    const size_t limit = payload < _gatt_db.BUFFER_SIZE ? payload : _gatt_db.BUFFER_SIZE;
+    // One lossless chunk per loop; existing MTU-sized telemetry stays a single
+    // notification. Credits are checked before ArduinoBLE's blocking send path.
+    _tx_queue.flush_one(limit, HCI.canSendAclPkt(ATT.notificationPeerCount()),
+        [this](const uint8_t* data, size_t length)
+        {
+            return _gatt_db.TXChar.writeValue(data, length) > 0;
+        });
 }
 
 bool ExoBLE::send_controller_snapshot(const UART_msg_t &msg)
@@ -398,13 +390,18 @@ bool ExoBLE::send_controller_snapshot(const UART_msg_t &msg)
         return false;
     }
 
-    // Host limits: 32 values, 512 frame characters, 16 characters per token.
-    // Build the entire frame before sending so invalid snapshots are not partial.
-    char frame[513];
-    int written = snprintf(frame, sizeof(frame), "S%c%uc%un%un",
+    // Serialize directly into bounded FIFO storage, then commit atomically.
+    char* frame = reinterpret_cast<char*>(_tx_queue.writable_data());
+    if (frame == nullptr)
+    {
+        logger::println("ExoBLE::send_controller_snapshot transmission queue full", LogLevel::Error);
+        return false;
+    }
+    const size_t capacity = BleTxQueue::MAX_FRAME_BYTES + 1;
+    int written = snprintf(frame, capacity, "S%c%uc%un%un",
         ble_names::live_controller_params, (unsigned)(param_count + 2),
         (unsigned)msg.joint_id, (unsigned)controller_id);
-    if (written <= 0 || written >= (int)sizeof(frame))
+    if (written <= 0 || written >= (int)capacity)
     {
         return false;
     }
@@ -416,9 +413,9 @@ bool ExoBLE::send_controller_snapshot(const UART_msg_t &msg)
         {
             return false;
         }
-        written = snprintf(frame + length, sizeof(frame) - length, "%.9g", (double)value);
+        written = snprintf(frame + length, capacity - length, "%.9g", (double)value);
         if (written <= 0 || written > 16 ||
-            length + (size_t)written + 1 > sizeof(frame) - 1)
+            length + (size_t)written + 1 > BleTxQueue::MAX_FRAME_BYTES)
         {
             return false;
         }
@@ -427,21 +424,7 @@ bool ExoBLE::send_controller_snapshot(const UART_msg_t &msg)
         frame[length] = '\0';
     }
 
-    for (size_t offset = 0; offset < length;)
-    {
-        const size_t chunk_length = (length - offset > kHandshakeChunkSize)
-            ? kHandshakeChunkSize : length - offset;
-        if (!_connected || !_tx_subscribed || !BLE.connected() ||
-            !_gatt_db.TXChar.subscribed() ||
-            _gatt_db.TXChar.writeValue((const uint8_t *)(frame + offset), chunk_length) <= 0)
-        {
-            return false;
-        }
-        offset += chunk_length;
-        // Use the established handshake pacing to avoid overrunning notifications.
-        delay(20);
-    }
-    return true;
+    return _tx_queue.commit(length);
 }
 
 void ExoBLE::send_error(int error_code, int joint_id)
@@ -476,20 +459,12 @@ void ExoBLE::_on_tx_subscribed(BLEDevice /*central*/, BLECharacteristic characte
     }
 }
 
-void ExoBLE::_handle_tx_subscribed(BLECharacteristic characteristic)
+void ExoBLE::_handle_tx_subscribed(BLECharacteristic /*characteristic*/)
 {
     _tx_subscribed = true;
-    if (_connected <= 0 || _handshake_sent_this_connection)
-    {
-        return;
-    }
-
-    const bool delivered = send_handshake_payload(characteristic);
-    _handshake_payload_pending = !delivered;
-    if (delivered)
-    {
-        _handshake_sent_this_connection = true;
-    }
+    // Sending from an ATT callback can re-enter HCI.poll while its receive
+    // buffer is still being dispatched. Main-loop polling delivers the preamble.
+    _handshake_payload_pending = !_handshake_sent_this_connection;
 }
 
 void ble_rx::on_rx_recieved(BLEDevice central, BLECharacteristic characteristic)

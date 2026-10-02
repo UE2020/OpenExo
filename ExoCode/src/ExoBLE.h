@@ -26,6 +26,7 @@
 #include "BleMessage.h"
 #include "BleMessageQueue.h"
 #include "UART_msg_t.h"
+#include "BleTxQueue.h"
 
 class ExoBLE 
 {
@@ -64,13 +65,13 @@ class ExoBLE
          * @brief Send a BLE message using the Nordic UART Service. The data is serialized with the parser object. 
          * 
          * @param msg The message that you would like to send.
-         * @return true If the serialized message was handed to a subscribed peer.
-         * @return false If there was no connection, serialization failed, or no
-         *         peer was subscribed to notifications.
+         * @return true If the serialized frame was queued for a subscribed peer.
+         * @return false If there was no subscription, serialization failed, or
+         *         the bounded transmission queue was full.
          */
         bool send_message(BleMessage &msg);
 
-        // Raw float32 readback: variable-length p frame, never telemetry scaling.
+        // Queue raw float32 readback; never block UART/I2C servicing on BLE.
         bool send_controller_snapshot(const UART_msg_t &msg);
 
         /**
@@ -87,6 +88,7 @@ class ExoBLE
         bool _handshake_payload_pending = true;
         bool _tx_subscribed = false;
         bool _handshake_sent_this_connection = false;
+        BleTxQueue _tx_queue;
         
         //The Gatt database which defines the services and characteristics
         GattDb _gatt_db = GattDb();
@@ -97,6 +99,7 @@ class ExoBLE
         static ExoBLE* _instance;
         static void _on_tx_subscribed(BLEDevice central, BLECharacteristic characteristic);
         void _handle_tx_subscribed(BLECharacteristic characteristic);
+        void _flush_tx_queue();
 };
 
 /**
