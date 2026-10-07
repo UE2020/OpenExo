@@ -543,7 +543,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._device_paused = True
             self.qt_dev.motorOff()
             if self._csv_file is not None:
-                self.trial_page.set_recording_state(True, "Recording paused with exo")
+                self.trial_page.set_recording_state(True, "Recording (exo paused)")
         except Exception as e:
             self.logger.error(f"Failed to turn motors off: {e}")
             self.logger.debug(traceback.format_exc())
@@ -991,7 +991,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._mark_counter = 0  # Reset mark counter for new trial
             self._csv_path_last = fname
             self.logger.info(f"Started CSV logging to: {fname}")
-            status = "Recording paused with exo" if self._device_paused else "Recording"
+            status = "Recording (exo paused)" if self._device_paused else "Recording"
             self.trial_page.set_recording_state(True, status)
             try:
                 self.scan_page.status.setText(f"Logging to {fname}")
