@@ -205,7 +205,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.logger.error(f"Failed to apply values to bio feedback page: {e}")
                 self.logger.debug(traceback.format_exc())
             # CSV logging
-            if self._csv_writer is not None and not self._device_paused:
+            if self._csv_writer is not None:
                 if not self._csv_header_written:
                     header = ["epoch", "mark"]
                     # Only include first 10 parameters (exclude battery and beyond)
