@@ -10,6 +10,7 @@ except ImportError as e:
     raise SystemExit("PySide6 is required. Install with: pip install PySide6") from e
 
 from MainWindow import MainWindow
+from services.power_management import enable_awake_mode
 from styles import DARK_STYLESHEET
 
 
@@ -127,8 +128,24 @@ def main():
         w.show()
         
         logger.info("Application ready - entering event loop")
-        exit_code = app.exec()
-        
+        restore_power_policy = None
+        try:
+            restore_power_policy = enable_awake_mode()
+            if restore_power_policy is not None:
+                logger.info("Windows display and system sleep prevention enabled")
+        except OSError as e:
+            logger.warning("Could not enable Windows keep-awake mode: %s", e)
+
+        try:
+            exit_code = app.exec()
+        finally:
+            if restore_power_policy is not None:
+                try:
+                    restore_power_policy()
+                    logger.info("Windows power policy restored")
+                except OSError as e:
+                    logger.warning("Could not restore Windows power policy: %s", e)
+
         logger.info(f"Application exited normally with code {exit_code}")
         sys.exit(exit_code)
         
