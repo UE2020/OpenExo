@@ -97,6 +97,9 @@ class ComsMCU
         // _Battery* _battery;
 
         const int _mark_index = 1;
+        bool _perturbation_requested = false;
+        bool _perturbation_ready = false;
+        uint32_t _last_perturbation_link_ms = 0;
         bool _reset_pending = false;
         uint32_t _reset_start_ms = 0;
         const uint32_t _reset_delay_ms = 5000;

@@ -13,6 +13,7 @@
 #include "Logger.h"
 #include "RealTimeI2C.h"
 #include "SystemReset.h"
+#include "AnklePerturbationUart.h"
 
 /**
  * @brief Type to associate a command with an ammount of data
@@ -861,6 +862,9 @@ namespace UART_command_utils
 		
 		Serial.print("\nmsg.command:");
 		Serial.print(msg.command);
+        #if defined(ARDUINO_TEENSY36) || defined(ARDUINO_TEENSY41)
+        if (ankle_perturbation::handle_uart(handler, exo_data, msg)) return;
+        #endif
         switch (msg.command)
         {
         case UART_command_names::empty_msg:

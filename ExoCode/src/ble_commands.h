@@ -52,6 +52,8 @@ namespace ble_names
     static const char mark              = 'N';
     static const char update_param      = 'f';
     static const char reset_system      = 'Z';
+    static const char perturbation_query = 'J';
+    static const char perturbation_request = 'j';
 
     //Sending Commands (Firmware->GUI)
     static const char send_real_time_data = '?';
@@ -87,6 +89,8 @@ namespace ble
         {ble_names::new_trq,            4},
         {ble_names::update_param,       4},
         {ble_names::reset_system,       0},
+        {ble_names::perturbation_query, 0},
+        {ble_names::perturbation_request, 4},
         
         //Sending Commands
         {ble_names::send_batt,              1},

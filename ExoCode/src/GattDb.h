@@ -26,6 +26,9 @@ class GattDb
         BLECharacteristic TXChar{"6E400003-B5A3-F393-E0A9-E50E24DCCA9E", BLERead | BLENotify | BLEBroadcast,             BUFFER_SIZE, BUFFERS_FIXED_LENGTH};
         BLECharacteristic RXChar{"6E400002-B5A3-F393-E0A9-E50E24DCCA9E", BLEWriteWithoutResponse | BLEWrite | BLENotify, BUFFER_SIZE, BUFFERS_FIXED_LENGTH};
 
+        // Complete feature status is readable independently of lossy UART notifications.
+        BLECharacteristic PerturbationStatusChar{"6E400004-B5A3-F393-E0A9-E50E24DCCA9E", BLERead, 20, false};
+
         //Service and Characteristics for exo info
         BLEService UARTServiceDeviceInfo{"e0271458-8c6a-11ed-a1eb-0242ac120002"};                                           //Serivce UUID for sending exo data
         BLECharacteristic PCBChar{"e0271459-8c6a-11ed-a1eb-0242ac120002", BLERead, BUFFER_SIZE, BUFFERS_FIXED_LENGTH};      //Characteristic for pcb

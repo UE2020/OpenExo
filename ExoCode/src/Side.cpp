@@ -1,4 +1,5 @@
 #include "Side.h"
+#include "AnklePerturbationSupport.h"
 #include "Logger.h"
 //#define SIDE_DEBUG 1
 
@@ -94,6 +95,10 @@ void Side::run_side()
         logger::print(_is_left ? "Left " : "Right ");
         logger::println("Side :: run_side : updating motor commands");
     #endif
+
+    // Ground strike was sampled on THIS control cycle, not received over BLE.
+    _data->perturbation.tick(millis(), _is_left ? 1 : 2, _side_data->ground_strike,
+        ankle_perturbation::allowed(_data, _data->perturbation.side()));
 
     //Calculates the new motor commands and sends them.
     update_motor_cmds();

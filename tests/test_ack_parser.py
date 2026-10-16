@@ -66,14 +66,22 @@ qt = types.SimpleNamespace(
     QRegularExpression=Regex,
     Slot=lambda *args: lambda fn: fn,
 )
-sys.modules.setdefault("PySide6", types.SimpleNamespace(QtCore=qt))
-
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location(
     "tested_rt_bridge", ROOT / "Python_GUI/services/RtBridge.py"
 )
 module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
+# Scope the stub to this isolated module: real Qt integration tests share the
+# pytest process and must not inherit a fake PySide6 package at collection time.
+_previous_pyside = sys.modules.get("PySide6")
+sys.modules["PySide6"] = types.SimpleNamespace(QtCore=qt)
+try:
+    spec.loader.exec_module(module)
+finally:
+    if _previous_pyside is None:
+        sys.modules.pop("PySide6", None)
+    else:
+        sys.modules["PySide6"] = _previous_pyside
 logging.disable(logging.CRITICAL)
 
 

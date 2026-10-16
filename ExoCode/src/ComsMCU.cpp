@@ -67,6 +67,27 @@ void ComsMCU::handle_ble()
 
     bool non_empty_ble_queue = _exo_ble->handle_updates();
 
+    // Only negotiated sessions generate link supervision or new notifications.
+    if (_perturbation_requested)
+    {
+        const bool connected = _exo_ble->connected();
+        const uint32_t now = millis();
+        if (!connected || uint32_t(now - _last_perturbation_link_ms) >= 100)
+        {
+            UART_msg_t link{};
+            link.command = ankle_perturbation::wire::link;
+            link.len = 1;
+            link.data[0] = connected ? 1 : 0;
+            UARTHandler::get_instance()->UART_msg(link);
+            _last_perturbation_link_ms = now;
+        }
+        if (!connected)
+        {
+            _perturbation_requested = false;
+            _perturbation_ready = false;
+        }
+    }
+
     if (non_empty_ble_queue)
     {
         #if COMSMCU_DEBUG
@@ -132,7 +153,18 @@ void ComsMCU::update_UART()
 
         if (msg.command)
         {
-            if (msg.command == UART_command_names::update_controller_param_ack)
+            if (msg.command == ankle_perturbation::wire::status)
+            {
+                ankle_perturbation::Status event;
+                if (_perturbation_requested && _exo_ble->connected() &&
+                    ankle_perturbation::wire::unpack_status(msg, event))
+                {
+                    if (event.request_id == 0 && event.side == 0 && event.state == 0)
+                        _perturbation_ready = true;
+                    _exo_ble->send_perturbation_status(event);
+                }
+            }
+            else if (msg.command == UART_command_names::update_controller_param_ack)
             {
                 _send_param_update_ack(msg);
             }
@@ -324,6 +356,25 @@ void ComsMCU::_process_complete_gui_command(BleMessage* msg)
         {
             _send_param_update_ack(request, false, reason);
         }
+        break;
+    }
+    case ble_names::perturbation_query:
+    {
+        if (!msg->is_complete || msg->expecting != 0) break;
+        _perturbation_requested = true;
+        _perturbation_ready = false;
+        _last_perturbation_link_ms = millis();
+        UART_msg_t query{};
+        query.command = ankle_perturbation::wire::query;
+        UARTHandler::get_instance()->UART_msg(query);
+        break;
+    }
+    case ble_names::perturbation_request:
+    {
+        UART_msg_t request{};
+        if (_perturbation_ready && msg->is_complete &&
+            ankle_perturbation::wire::from_ble(msg->data, msg->expecting, request))
+            UARTHandler::get_instance()->UART_msg(request);
         break;
     }
     case ble_names::reset_system:

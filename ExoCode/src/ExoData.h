@@ -14,6 +14,7 @@
 #include "Arduino.h"
 
 #include "SideData.h"
+#include "AnklePerturbation.h"
 #include <stdint.h>
 #include "ParseIni.h"
 #include "Board.h"
@@ -162,6 +163,7 @@ class ExoData
 		float filtered_batt_pwr = 0;/**< Filtered battery power*/
         SideData left_side;     /**< Data for the left side */
         SideData right_side;    /**< Data for the right side */
+        ankle_perturbation::Engine perturbation; // inert until explicitly negotiated/armed
 
         uint32_t mark;          /**< Used for timing, currently only used by the nano */
 

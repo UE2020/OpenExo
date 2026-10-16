@@ -86,9 +86,14 @@ bool Exo::run()
             data->for_each_joint([](JointData* j_data, float* args){j_data->motor.enabled = false;});
         }
 		
+        // Evaluate expiry and safety even when the selected side/controller is disabled.
+        data->perturbation.tick(millis(), 0, false,
+            ankle_perturbation::allowed(data, data->perturbation.side()));
+
         //Record the side data and send new commands to the motors.
         left_side.run_side();
         right_side.run_side();
+        ankle_perturbation::flush_events(handler, data);
 		
         //Update status LED
         status_led.update(data->get_status());

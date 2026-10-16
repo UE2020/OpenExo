@@ -24,6 +24,14 @@ UART_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 UART_TX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  # Write
 UART_RX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # Notify
 ERROR_CHAR_UUID = "33b65d43-611c-11ed-9b6a-0242ac120002"  # Notify
+PERTURBATION_STATUS_UUID = "6e400004-b5a3-f393-e0a9-e50e24dcca9e"  # Read-only status
+
+
+def _make_ble_client(target, disconnected_callback):
+    # Firmware updates can add a characteristic. Do not reuse Windows' old
+    # service/characteristic cache when opening the next connection.
+    return BleakClient(target, disconnected_callback=disconnected_callback,
+                       winrt={"use_cached_services": False})
 
 
 class QtExoDeviceManager(QtCore.QObject):
@@ -40,6 +48,7 @@ class QtExoDeviceManager(QtCore.QObject):
     log = QtCore.Signal(str)
     dataReceived = QtCore.Signal(bytes)     # raw bytes from UART RX notify
     deviceErrorReceived = QtCore.Signal(str)  # error messages from ErrorChar notify
+    perturbationStatusReceived = QtCore.Signal(dict)
     scanResults = QtCore.Signal(list)       # list[(name, address)]
     scanProgress = QtCore.Signal(int)       # scan progress percentage (0-100)
     connectScanProgress = QtCore.Signal(int) # scanning phase during connection (0-100)
@@ -49,6 +58,7 @@ class QtExoDeviceManager(QtCore.QObject):
         super().__init__(parent)
         self._mac: Optional[str] = None
         self._client: Optional[object] = None
+        self._perturbation_read_inflight = False
         self._state_lock = threading.RLock()
         self._session_generation = 0
         self._write_lock: Optional[asyncio.Lock] = None
@@ -455,7 +465,7 @@ class QtExoDeviceManager(QtCore.QObject):
                     except Exception:
                         pass
 
-                client = BleakClient(target, disconnected_callback=_disc_cb)
+                client = _make_ble_client(target, _disc_cb)
                 try:
                     ok = await client.connect()
 
@@ -960,6 +970,62 @@ class QtExoDeviceManager(QtCore.QObject):
             [(b"x", True, 0.0)],
             "Motor ON command sent",
         )
+
+    def readPerturbationStatus(self) -> bool:
+        """Read the complete cached outcome; NEVER retransmit an arm request."""
+        session = self._capture_session()
+        if session is None or self._perturbation_read_inflight:
+            return False
+        client, generation = session
+        if client.services.get_characteristic(PERTURBATION_STATUS_UUID) is None:
+            return False  # Older firmware: retain existing unknown-status lockout.
+        self._perturbation_read_inflight = True
+
+        async def read_status():
+            try:
+                if not self._is_current_session(client, generation):
+                    return
+                data = await asyncio.wait_for(client.read_gatt_char(
+                    PERTURBATION_STATUS_UUID, use_cached=False), timeout=1.0)
+                from services.Perturbation import decode_readback
+                reply = decode_readback(bytes(data))
+                if self._is_current_session(client, generation):
+                    self.logger.debug("Perturbation status readback: %s", reply)
+                    self.perturbationStatusReceived.emit(reply)
+            except Exception:
+                self.logger.debug("Perturbation status readback unavailable", exc_info=True)
+            finally:
+                self._perturbation_read_inflight = False
+
+        if self._submit(read_status()) is None:
+            self._perturbation_read_inflight = False
+            return False
+        return True
+
+    def queryPerturbation(self) -> bool:
+        """Safe single-byte capability probe, ignored by legacy firmware."""
+        if not self._ensure_connected():
+            return False
+        self._queue_write_steps([(b"J", True, 0.0)], "Perturbation capability query")
+        return True
+
+    def sendPerturbation(self, side, magnitude, duration_ms, request_id) -> bool:
+        """One locked BLE transaction; scheduling remains on the Teensy."""
+        import math
+        values = (side, magnitude, duration_ms, request_id)
+        if not all(math.isfinite(v) for v in values):
+            return False
+        if request_id != int(request_id) or not 1 <= request_id <= 9999:
+            return False
+        cancel = side == 0 and magnitude == 0 and duration_ms == 1
+        arm = (side in (1, 2) and 0 < abs(magnitude) <= 10
+               and duration_ms == int(duration_ms) and 10 <= duration_ms <= 200)
+        if not (cancel or arm) or not self._ensure_connected():
+            return False
+        steps = [(b"j", True, 0.0)]
+        steps.extend((struct.pack("<d", float(v)), True, 0.0) for v in values)
+        self._queue_write_steps(steps, "Perturbation request sent (await firmware ACK)")
+        return True
 
     @QtCore.Slot(list)
     def updateTorqueValues(self, parameter_list: list) -> bool:

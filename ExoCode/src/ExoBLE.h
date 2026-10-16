@@ -25,6 +25,7 @@
 #include "GattDb.h"
 #include "BleMessage.h"
 #include "BleMessageQueue.h"
+#include "AnklePerturbationProtocol.h"
 
 class ExoBLE 
 {
@@ -68,6 +69,8 @@ class ExoBLE
          *         peer was subscribed to notifications.
          */
         bool send_message(BleMessage &msg);
+        bool connected() const { return _connected > 0; }
+        bool send_perturbation_status(const ankle_perturbation::Status& event);
 
         /**
          * @brief Send an error code to the GUI, uses a seperate service and characteristic

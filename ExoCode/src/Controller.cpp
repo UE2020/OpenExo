@@ -3,6 +3,7 @@
 */
 
 #include "Controller.h"
+#include "AnklePerturbationSupport.h"
 #include "Logger.h"
 //#define CONTROLLER_DEBUG          //Uncomment to enable debug statements to be printed to the serial monitor
 
@@ -643,6 +644,9 @@ float ProportionalJointMoment::calc_motor_cmd()
             _controller_data->kf = max(0.75, _controller_data->kf);
         }
     }
+
+    // Perturb the tracked target, not the PID output (feedback must not fight it).
+    cmd_ff += ankle_perturbation::offset(_data, _joint_data);
 
     /* Filters the Setpoint */
     _controller_data->filtered_setpoint = utils::ewma(cmd_ff, _controller_data->filtered_setpoint, 1);
@@ -2956,6 +2960,7 @@ float PJMC_PLUS::calc_motor_cmd()
 	float percent_grf_heel = constrain(_side_data->heel_fsr, 0, 1.5);
 	float cmd_ff = _pjmc_generic(percent_grf, threshold, dorsi_setpoint, -plantar_setpoint);
 	cmd_ff = min(dorsi_setpoint, cmd_ff);//cap the dorsiflexion setpoint
+    cmd_ff += ankle_perturbation::offset(_data, _joint_data);
 	
 	// if (!_joint_data->is_left){
 		// Serial.print("\nRunning pjmcPlus...");

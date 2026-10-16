@@ -36,6 +36,9 @@ class ActiveTrialPage(QtWidgets.QWidget):
     markTrialRequested = QtCore.Signal()
     deviceStartRequested = QtCore.Signal()
     deviceStopRequested = QtCore.Signal()
+    perturbationArmRequested = QtCore.Signal(int, float, int)
+    perturbationCancelRequested = QtCore.Signal()
+    perturbationCheckRequested = QtCore.Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -150,6 +153,49 @@ class ActiveTrialPage(QtWidgets.QWidget):
         self.btn_pause_play = QtWidgets.QPushButton("Pause")
         self.is_paused = False
         controls.addWidget(self.btn_pause_play)
+
+        controls.addWidget(create_section_label("Ankle Perturbation"))
+        self.lbl_impulse_help = QtWidgets.QLabel(
+            "One pulse at next step onset. Added to assistance/PID target.")
+        self.lbl_impulse_help.setWordWrap(True)
+        controls.addWidget(self.lbl_impulse_help)
+        impulse_form = QtWidgets.QFormLayout()
+        self.spin_impulse_magnitude = QtWidgets.QDoubleSpinBox()
+        self.spin_impulse_magnitude.setRange(-10.0, 10.0)
+        self.spin_impulse_magnitude.setDecimals(2)
+        self.spin_impulse_magnitude.setSingleStep(0.25)
+        self.spin_impulse_magnitude.setSuffix(" Nm")
+        self.spin_impulse_magnitude.setValue(0.0)
+        self.spin_impulse_magnitude.setToolTip(
+            "Signed joint torque increment; confirm physical direction on bench. Zero cannot arm.")
+        self.spin_impulse_duration = QtWidgets.QSpinBox()
+        self.spin_impulse_duration.setRange(10, 200)
+        self.spin_impulse_duration.setSingleStep(10)
+        self.spin_impulse_duration.setSuffix(" ms")
+        self.spin_impulse_duration.setValue(100)
+        impulse_form.addRow("Torque increment", self.spin_impulse_magnitude)
+        impulse_form.addRow("Pulse duration", self.spin_impulse_duration)
+        controls.addLayout(impulse_form)
+        self.btn_check_impulse = QtWidgets.QPushButton("Check Firmware")
+        controls.addWidget(self.btn_check_impulse)
+        arm_row = QtWidgets.QHBoxLayout()
+        self.btn_arm_left = QtWidgets.QPushButton("Arm LEFT")
+        self.btn_arm_right = QtWidgets.QPushButton("Arm RIGHT")
+        for side, button in ((1, self.btn_arm_left), (2, self.btn_arm_right)):
+            button.setEnabled(False)
+            button.clicked.connect(lambda checked=False, selected=side:
+                self.perturbationArmRequested.emit(selected,
+                    self.spin_impulse_magnitude.value(), self.spin_impulse_duration.value()))
+            arm_row.addWidget(button)
+        controls.addLayout(arm_row)
+        self.btn_cancel_impulse = QtWidgets.QPushButton("Cancel Perturbation")
+        self.btn_cancel_impulse.setEnabled(False)
+        controls.addWidget(self.btn_cancel_impulse)
+        self.lbl_impulse_status = QtWidgets.QLabel("Check firmware before arming")
+        self.lbl_impulse_status.setWordWrap(True)
+        controls.addWidget(self.lbl_impulse_status)
+        self.btn_check_impulse.clicked.connect(self.perturbationCheckRequested.emit)
+        self.btn_cancel_impulse.clicked.connect(self.perturbationCancelRequested.emit)
         
         # Separator
         controls.addSpacing(UIConfig.SPACING_XLARGE)
@@ -350,6 +396,17 @@ class ActiveTrialPage(QtWidgets.QWidget):
         self._param_names = []
         # Track real data start time
         self._real_data_t0 = None
+
+    def set_perturbation_state(self, ready: bool, busy: bool, message: str):
+        self.btn_arm_left.setEnabled(ready)
+        self.btn_arm_right.setEnabled(ready)
+        self.btn_cancel_impulse.setEnabled(busy)
+        self.btn_check_impulse.setEnabled(not busy)
+        self.spin_impulse_magnitude.setEnabled(not busy)
+        self.spin_impulse_duration.setEnabled(not busy)
+        self.lbl_impulse_status.setText(message)
+        self.lbl_impulse_status.setStyleSheet(
+            "color: #f4b942; font-weight: bold;" if busy else "")
 
     def set_update_controller_enabled(self, enabled: bool):
         try:

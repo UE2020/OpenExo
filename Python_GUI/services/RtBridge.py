@@ -25,6 +25,7 @@ class RtBridge(QtCore.QObject):
     controllerMatrixReceived = QtCore.Signal(list)
     controllerValuesReceived = QtCore.Signal(list)
     paramUpdateAckReceived = QtCore.Signal(dict)
+    perturbationStatusReceived = QtCore.Signal(dict)
     rtDataUpdated = QtCore.Signal(list)
 
     def __init__(self, parent=None):
@@ -583,6 +584,26 @@ class RtBridge(QtCore.QObject):
             count,
             [token.decode("ascii", errors="replace") for token in tokens],
         )
+        if command == b"p":
+            # Lifecycle events are never real-time channels or PID telemetry.
+            try:
+                import math
+                values = [float(token) / 100.0 for token in tokens]
+                if count != 5 or not all(math.isfinite(v) for v in values):
+                    return
+                request_id, side, state, magnitude, duration = values
+                if any(v != int(v) for v in (request_id, side, state, duration)):
+                    return
+                if not (0 <= request_id <= 9999 and side in (0, 1, 2) and 0 <= state <= 6):
+                    return
+                if abs(magnitude) > 10 or not 0 <= duration <= 200:
+                    return
+                self.perturbationStatusReceived.emit(dict(
+                    request_id=int(request_id), side=int(side), state=int(state),
+                    magnitude=magnitude, duration_ms=int(duration)))
+            except (ValueError, OverflowError):
+                self.logger.warning("Ignoring invalid perturbation status")
+            return
         if command == b"a":
             event_data = b"n".join(tokens).decode("ascii", errors="ignore")
             self._handle_param_update_ack(event_data, count)

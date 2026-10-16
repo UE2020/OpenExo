@@ -185,6 +185,7 @@ bool ExoBLE::setup()
     //UART Chars
     _gatt_db.UARTService.addCharacteristic(_gatt_db.TXChar);
     _gatt_db.UARTService.addCharacteristic(_gatt_db.RXChar);
+    _gatt_db.UARTService.addCharacteristic(_gatt_db.PerturbationStatusChar);
 
     //Device Info Chars
     _gatt_db.UARTServiceDeviceInfo.addCharacteristic(_gatt_db.PCBChar);
@@ -369,6 +370,27 @@ bool ExoBLE::send_message(BleMessage &msg)
     {
         logger::println("ExoBLE::send_message notification not delivered", LogLevel::Warn);
         return false;
+    }
+    return true;
+}
+
+bool ExoBLE::send_perturbation_status(const ankle_perturbation::Status& event)
+{
+    if (!_connected) return false;
+    uint8_t readback[20];
+    const int readback_length = ankle_perturbation::wire::pack_readback(event, readback, sizeof(readback));
+    if (readback_length) _gatt_db.PerturbationStatusChar.writeValue(readback, readback_length);
+    char buffer[80];
+    const int length = ankle_perturbation::wire::format_status(event, buffer, sizeof(buffer));
+    if (!length) return false;
+    // This additive frame uses minimum-MTU-safe chunks; do not change legacy
+    // real-time framing/handshake or rely on the GUI's truncated-ACK recovery.
+    for (int offset=0; offset<length; offset+=20)
+    {
+        const int remaining = length-offset;
+        const int count = remaining < 20 ? remaining : 20;
+        if (_gatt_db.TXChar.writeValue((const uint8_t*)buffer+offset, count) <= 0) return false;
+        if (remaining > 20) delay(2);
     }
     return true;
 }

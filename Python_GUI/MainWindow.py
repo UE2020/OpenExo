@@ -80,6 +80,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Services
         self.qt_dev = QtExoDeviceManager(self)
+        from services.Perturbation import PerturbationSession
+        self.perturbation = PerturbationSession(self.qt_dev, self)
+        self.perturbation.changed.connect(self._update_perturbation_ui)
+        self.perturbation.event.connect(self._on_perturbation_event)
+        self.trial_page.perturbationArmRequested.connect(self.perturbation.arm)
+        self.trial_page.perturbationCancelRequested.connect(self.perturbation.cancel)
+        self.trial_page.perturbationCheckRequested.connect(self.perturbation.check_firmware)
+        self.qt_dev.disconnected.connect(self.perturbation.reset)
         # Bind scan page scanner to use the Qt device manager for scanning
         try:
             self.scan_page.bind_device_manager(self.qt_dev)
@@ -97,6 +105,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rt_bridge.controllerMatrixReceived.connect(self._on_controller_matrix)
         self.rt_bridge.controllerValuesReceived.connect(self._on_controller_values)
         self.rt_bridge.paramUpdateAckReceived.connect(self._on_param_update_ack)
+        self.rt_bridge.perturbationStatusReceived.connect(self.perturbation.receive)
+        self.qt_dev.perturbationStatusReceived.connect(self.perturbation.receive)
 
         # CSV logging state
         self._csv_file = None
@@ -148,6 +158,23 @@ class MainWindow(QtWidgets.QMainWindow):
         if log_path and log_path != "Log file not available":
             self.logger.info("Device manager log file: %s", log_path)
 
+    def _update_perturbation_ui(self):
+        session = self.perturbation
+        self.trial_page.set_perturbation_state(session.ready, session.busy, session.message)
+
+    def _on_perturbation_event(self, event):
+        self.logger.info("Perturbation firmware event (GUI receipt time): %s", event)
+        # Keep the existing telemetry CSV schema unchanged. These timestamps
+        # describe BLE receipt, not the exact physical onset on the Teensy.
+        if self._csv_file is not None:
+            import json
+            record = dict(epoch=time.time(), timestamp_kind="gui_receipt", event=event)
+            try:
+                with open(self._csv_file.name + ".perturbations.jsonl", "a", encoding="utf-8") as output:
+                    output.write(json.dumps(record, allow_nan=False) + "\n")
+            except (OSError, ValueError):
+                self.logger.exception("Could not save perturbation event sidecar")
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
 
@@ -174,12 +201,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # Begin trial sequence (E -> L -> R + thresholds) to ensure FSRs stream
         try:
             self.qt_dev.beginTrial()
+            self.perturbation.set_running(True)
         except Exception as e:
             self.logger.error(f"Failed to begin trial: {e}")
             self.logger.debug(traceback.format_exc())
 
     @QtCore.Slot(str)
     def _on_connect_requested(self, mac: str):
+        self.perturbation.reset()
         # Start BLE connection via Qt device manager
         try:
             # Clear partial handshake/stream state before notifications for the
@@ -529,6 +558,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.logger.info("Turning motors ON")
             self._device_paused = False
             self.qt_dev.motorOn()
+            if hasattr(self, "perturbation"):
+                self.perturbation.set_running(True)
             if self._csv_file is not None:
                 self.trial_page.set_recording_state(True, "Recording")
         except Exception as e:
@@ -542,6 +573,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.logger.info("Turning motors OFF")
             self._device_paused = True
             self.qt_dev.motorOff()
+            if hasattr(self, "perturbation"):
+                self.perturbation.set_running(False)
             if self._csv_file is not None:
                 self.trial_page.set_recording_state(True, "Recording (exo paused)")
         except Exception as e:
@@ -598,6 +631,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot()
     def _on_end_trial(self):
+        self.perturbation.set_running(False)
         try:
             self._destroy_controller_db()
             self.logger.info("Ending trial...")
@@ -646,6 +680,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot()
     def _on_disconnect(self):
+        self.perturbation.reset()
         try:
             self._destroy_controller_db()
             self.logger.info("Manual disconnect requested")
