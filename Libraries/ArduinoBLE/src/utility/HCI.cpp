@@ -75,6 +75,7 @@
 HCIClass::HCIClass() :
   _debug(NULL),
   _recvIndex(0),
+  _maxPkt(0),
   _pendingPkt(0)
 {
 }
@@ -411,6 +412,12 @@ int HCIClass::leConnUpdate(uint16_t handle, uint16_t minInterval, uint16_t maxIn
   leConnUpdateData.maxCeLength = 0x0006;
 
   return sendCommand(OGF_LE_CTL << 10 | OCF_LE_CONN_UPDATE, sizeof(leConnUpdateData), &leConnUpdateData);
+}
+
+bool HCIClass::canSendAclPkt(uint8_t packets) const
+{
+  return packets > 0 && _pendingPkt <= _maxPkt &&
+         packets <= (_maxPkt - _pendingPkt);
 }
 
 int HCIClass::sendAclPkt(uint16_t handle, uint8_t cid, uint8_t plen, void* data)

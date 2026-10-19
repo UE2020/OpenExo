@@ -50,6 +50,8 @@ namespace UART_command_names
     static const uint8_t get_system_reset = 0x19;
     static const uint8_t update_system_reset = 0x1A;
     static const uint8_t update_controller_param_ack = 0x1B;
+    static const uint8_t get_live_controller_params = 0x1C;
+    static const uint8_t update_live_controller_params = 0x1D;
 };
 
 /**
@@ -64,6 +66,12 @@ namespace UART_command_enums
         PARAM_LENGTH = 1,
         PARAM_START = 2,
         LENGTH
+    };
+    enum class live_controller_params : uint8_t
+    {
+        CONTROLLER_ID = 0,
+        PARAM_LENGTH = 1,
+        PARAM_START = 2
     };
     enum class status : uint8_t
     {
@@ -139,6 +147,46 @@ namespace UART_command_enums
  */
 namespace UART_command_handlers
 {
+    inline static void get_live_controller_params(UARTHandler *handler, ExoData *exo_data, UART_msg_t msg)
+    {
+#if defined(ARDUINO_TEENSY36) || defined(ARDUINO_TEENSY41)
+        if (exo_data == NULL || msg.len != 0 ||
+            !param_update::has_valid_side(msg.joint_id) ||
+            !param_update::has_valid_joint_type(msg.joint_id))
+        {
+            return;
+        }
+
+        JointData *joint = exo_data->get_joint_with(msg.joint_id);
+        const bool is_left = (msg.joint_id & param_update::k_side_mask) == param_update::k_side_left;
+        if (joint == NULL || !joint->is_used || (uint8_t)joint->id != msg.joint_id ||
+            joint->is_left != is_left ||
+            !(is_left ? exo_data->left_side.is_used : exo_data->right_side.is_used))
+        {
+            return;
+        }
+
+        const uint8_t param_count = joint->controller.get_parameter_length();
+        const uint8_t param_start = (uint8_t)UART_command_enums::live_controller_params::PARAM_START;
+        // The BLE receiver allows 32 values, including joint and controller IDs.
+        if (param_count > controller_defs::max_parameters || param_count > 30 ||
+            param_start + param_count > UART_MSG_T_MAX_DATA_LEN)
+        {
+            return;
+        }
+
+        msg.command = UART_command_names::update_live_controller_params;
+        msg.len = param_start + param_count;
+        msg.data[(uint8_t)UART_command_enums::live_controller_params::CONTROLLER_ID] = joint->controller.controller;
+        msg.data[(uint8_t)UART_command_enums::live_controller_params::PARAM_LENGTH] = param_count;
+        for (uint8_t i = 0; i < param_count; ++i)
+        {
+            msg.data[param_start + i] = joint->controller.parameters[i];
+        }
+        handler->UART_msg(msg);
+#endif
+    }
+
     inline static void get_controller_params(UARTHandler *handler, ExoData *exo_data, UART_msg_t msg)
     {
          //logger::println("UART_command_handlers::update_controller_params->Fetching params with msg: ");
@@ -867,6 +915,9 @@ namespace UART_command_utils
             //logger::println("UART_command_utils::handle_message->Empty Message!");
             break;
 
+        case UART_command_names::get_live_controller_params:
+            UART_command_handlers::get_live_controller_params(handler, exo_data, msg);
+            break;
         case UART_command_names::get_controller_params:
             UART_command_handlers::get_controller_params(handler, exo_data, msg);
             break;

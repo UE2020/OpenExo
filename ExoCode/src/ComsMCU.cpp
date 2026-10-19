@@ -136,6 +136,10 @@ void ComsMCU::update_UART()
             {
                 _send_param_update_ack(msg);
             }
+            else if (msg.command == UART_command_names::update_live_controller_params)
+            {
+                _exo_ble->send_controller_snapshot(msg);
+            }
             else
             {
                 UART_command_utils::handle_msg(handler, _data, msg);
@@ -326,6 +330,9 @@ void ComsMCU::_process_complete_gui_command(BleMessage* msg)
         }
         break;
     }
+    case ble_names::get_live_controller_params:
+        ble_handlers::get_live_controller_params(_data, msg);
+        break;
     case ble_names::reset_system:
         _schedule_system_reset();
         break;

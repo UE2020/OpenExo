@@ -1,13 +1,15 @@
 #include "UARTHandler.h"
 #include "Utilities.h"
 #include "Logger.h"
+#include "uart_commands.h"
 
 #define MAX_NUM_LEGS 2
 #define MAX_NUM_JOINTS_PER_LEG 2 //Current PCB can only do 2 motors per side, if you have made a new PCB, update.
 #define UART_DATA_TYPE short int //If type is changes you will need to comment/uncomment lines in pack_float and unpack_float
 #define FIXED_POINT_FACTOR 100
 
-// Nano -> Teensy sends raw floats; Teensy -> Nano stays fixed-point ints.
+// Ordinary Nano -> Teensy payloads are floats; the reverse is fixed-point.
+// Live controller snapshots alone use raw float32 in both directions.
 #if defined(ARDUINO_ARDUINO_NANO33BLE) || defined(ARDUINO_NANO_RP2040_CONNECT)
 #define UART_PACK_FLOATS 1
 #define UART_UNPACK_FLOATS 0
@@ -194,22 +196,22 @@ void UARTHandler::_pack(uint8_t msg_id, uint8_t len, uint8_t joint_id, float *da
     data_to_pack[COMMAND] = msg_id;
     data_to_pack[JOINT_ID] = joint_id;
     
-    //Pack payload with platform-specific encoding.
-#if UART_PACK_FLOATS
-    uint8_t _num_bytes = sizeof(float);
-#else
-    uint8_t _num_bytes = sizeof(UART_DATA_TYPE);
-    uint8_t buf[_num_bytes];
-#endif
-    for (int i=0; i<len; i++)
+    const bool raw_floats = UART_PACK_FLOATS ||
+        msg_id == UART_command_names::update_live_controller_params;
+    const uint8_t num_bytes = raw_floats ? sizeof(float) : sizeof(UART_DATA_TYPE);
+    uint8_t buf[sizeof(UART_DATA_TYPE)];
+    for (int i = 0; i < len; ++i)
     {
-        uint8_t _offset = (DATA_START) + _num_bytes*i;
-#if UART_PACK_FLOATS
-        memcpy((data_to_pack + _offset), (uint8_t*)&data[i], _num_bytes);
-#else
-        utils::float_to_short_fixed_point_bytes(data[i], buf, FIXED_POINT_FACTOR);
-        memcpy((data_to_pack + _offset), buf, _num_bytes);
-#endif
+        const uint8_t offset = DATA_START + num_bytes * i;
+        if (raw_floats)
+        {
+            memcpy(data_to_pack + offset, &data[i], sizeof(float));
+        }
+        else
+        {
+            utils::float_to_short_fixed_point_bytes(data[i], buf, FIXED_POINT_FACTOR);
+            memcpy(data_to_pack + offset, buf, sizeof(buf));
+        }
     }
 }
 
@@ -221,11 +223,9 @@ UART_msg_t UARTHandler::_unpack(uint8_t* data, uint8_t len)
         return msg;
     }
 
-#if UART_UNPACK_FLOATS
-    const uint8_t _bytes_per = sizeof(float);
-#else
-    const uint8_t _bytes_per = sizeof(UART_DATA_TYPE);
-#endif
+    const bool raw_floats = UART_UNPACK_FLOATS ||
+        data[COMMAND] == UART_command_names::update_live_controller_params;
+    const uint8_t _bytes_per = raw_floats ? sizeof(float) : sizeof(UART_DATA_TYPE);
     const uint8_t _payload_bytes = len - DATA_START;
     if ((_payload_bytes % _bytes_per) != 0)
     {
@@ -246,15 +246,14 @@ UART_msg_t UARTHandler::_unpack(uint8_t* data, uint8_t len)
     for (int i=0; i<msg.len; i++)
     {
         uint8_t _data_offset = DATA_START + (i * _bytes_per);
-#if UART_UNPACK_FLOATS
-        float tmp = 0;
-        memcpy(&tmp, (uint8_t*)data + _data_offset, sizeof(float));
-        msg.data[i] = tmp;
-#else
-        float tmp = 0;
-        utils::short_fixed_point_bytes_to_float((uint8_t*)data+_data_offset, &tmp, FIXED_POINT_FACTOR);
-        msg.data[i] = tmp;
-#endif
+        if (raw_floats)
+        {
+            memcpy(&msg.data[i], data + _data_offset, sizeof(float));
+        }
+        else
+        {
+            utils::short_fixed_point_bytes_to_float(data + _data_offset, &msg.data[i], FIXED_POINT_FACTOR);
+        }
     }
 
     return msg;
@@ -263,12 +262,10 @@ UART_msg_t UARTHandler::_unpack(uint8_t* data, uint8_t len)
 uint16_t UARTHandler::_get_packed_length(uint8_t msg_id, uint8_t len, uint8_t joint_id, float *data)
 {
     uint16_t _val = 0;
-#if UART_PACK_FLOATS
-    _val += static_cast<uint16_t>(len) * sizeof(float);
-#else
-    //We are converting from float to short int, we must multiply by the size difference
-    _val += static_cast<uint16_t>(len) * sizeof(UART_DATA_TYPE);
-#endif
+    const bool raw_floats = UART_PACK_FLOATS ||
+        msg_id == UART_command_names::update_live_controller_params;
+    _val += static_cast<uint16_t>(len) *
+        (raw_floats ? sizeof(float) : sizeof(UART_DATA_TYPE));
     _val += sizeof(msg_id);
     _val += sizeof(joint_id); 
     return _val;
