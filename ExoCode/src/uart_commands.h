@@ -14,6 +14,7 @@
 #include "RealTimeI2C.h"
 #include "SystemReset.h"
 #include "AnklePerturbationUart.h"
+#include "FsrThresholdUart.h"
 
 /**
  * @brief Type to associate a command with an ammount of data
@@ -863,6 +864,7 @@ namespace UART_command_utils
 		Serial.print("\nmsg.command:");
 		Serial.print(msg.command);
         #if defined(ARDUINO_TEENSY36) || defined(ARDUINO_TEENSY41)
+        if (fsr_thresholds::handle_uart(handler, exo_data, msg)) return;
         if (ankle_perturbation::handle_uart(handler, exo_data, msg)) return;
         #endif
         switch (msg.command)

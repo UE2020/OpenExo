@@ -96,8 +96,11 @@ void Side::run_side()
         logger::println("Side :: run_side : updating motor commands");
     #endif
 
-    // Ground strike was sampled on THIS control cycle, not received over BLE.
-    _data->perturbation.tick(millis(), _is_left ? 1 : 2, _side_data->ground_strike,
+    // This rig has a forefoot FSR per foot. Leave shared ground-strike/gait
+    // detection unchanged; perturbations use only a fresh forefoot loading edge.
+    const uint8_t pulse_side = _is_left ? 1 : 2;
+    const bool contact_ready = _data->perturbation.contact_ready(pulse_side, _side_data->toe_stance);
+    _data->perturbation.tick(millis(), pulse_side, contact_ready && _side_data->toe_strike,
         ankle_perturbation::allowed(_data, _data->perturbation.side()));
 
     //Calculates the new motor commands and sends them.

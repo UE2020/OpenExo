@@ -25,6 +25,7 @@ UART_TX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  # Write
 UART_RX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # Notify
 ERROR_CHAR_UUID = "33b65d43-611c-11ed-9b6a-0242ac120002"  # Notify
 PERTURBATION_STATUS_UUID = "6e400004-b5a3-f393-e0a9-e50e24dcca9e"  # Read-only status
+FSR_THRESHOLD_STATUS_UUID = "6e400005-b5a3-f393-e0a9-e50e24dcca9e"
 
 
 def _make_ble_client(target, disconnected_callback):
@@ -49,6 +50,7 @@ class QtExoDeviceManager(QtCore.QObject):
     dataReceived = QtCore.Signal(bytes)     # raw bytes from UART RX notify
     deviceErrorReceived = QtCore.Signal(str)  # error messages from ErrorChar notify
     perturbationStatusReceived = QtCore.Signal(dict)
+    fsrThresholdStatusReceived = QtCore.Signal(dict)
     scanResults = QtCore.Signal(list)       # list[(name, address)]
     scanProgress = QtCore.Signal(int)       # scan progress percentage (0-100)
     connectScanProgress = QtCore.Signal(int) # scanning phase during connection (0-100)
@@ -59,6 +61,7 @@ class QtExoDeviceManager(QtCore.QObject):
         self._mac: Optional[str] = None
         self._client: Optional[object] = None
         self._perturbation_read_inflight = False
+        self._fsr_read_inflight = None
         self._state_lock = threading.RLock()
         self._session_generation = 0
         self._write_lock: Optional[asyncio.Lock] = None
@@ -999,6 +1002,68 @@ class QtExoDeviceManager(QtCore.QObject):
 
         if self._submit(read_status()) is None:
             self._perturbation_read_inflight = False
+            return False
+        return True
+
+    def queryFsrThresholds(self):
+        if not self._ensure_connected():
+            return False
+        self._queue_write_steps([(b"K", True, 0.0)], "FSR settings capability query")
+        return True
+
+    def sendFsrThresholds(self, operation, left, right, request_id):
+        from services.FsrThresholds import valid_center
+        import math
+        if (not all(math.isfinite(v) for v in (operation, left, right, request_id))
+                or operation not in (0, 1) or request_id != int(request_id)
+                or not 1 <= request_id <= 9999):
+            return False
+        if operation == 0 and (left != 0 or right != 0):
+            return False
+        if operation == 1 and not (valid_center(left) and valid_center(right)):
+            return False
+        if not self._ensure_connected():
+            return False
+        steps = [(b"k", True, 0.0)]
+        steps.extend((struct.pack('<d', float(v)), True, 0.0)
+                     for v in (operation, left, right, request_id))
+        self._queue_write_steps(steps, "FSR settings request (await control-MCU confirmation)")
+        return True
+
+    def readFsrThresholdStatus(self):
+        session = self._capture_session()
+        if session is None:
+            return False
+        client, generation = session
+        if client.services.get_characteristic(FSR_THRESHOLD_STATUS_UUID) is None:
+            return False
+        owner = (client, generation, object())
+        with self._state_lock:
+            current = self._fsr_read_inflight
+            if current is not None and current[0] is client and current[1] == generation:
+                return False
+            self._fsr_read_inflight = owner
+
+        async def read_status():
+            try:
+                if not self._is_current_session(client, generation):
+                    return
+                data = await asyncio.wait_for(client.read_gatt_char(
+                    FSR_THRESHOLD_STATUS_UUID, use_cached=False), timeout=1.0)
+                from services.FsrThresholds import decode_status
+                reply = decode_status(bytes(data))
+                if self._is_current_session(client, generation):
+                    self.fsrThresholdStatusReceived.emit(reply)
+            except Exception:
+                self.logger.debug("FSR settings readback unavailable", exc_info=True)
+            finally:
+                with self._state_lock:
+                    if self._fsr_read_inflight is owner:
+                        self._fsr_read_inflight = None
+        if self._submit(read_status()) is None:
+            with self._state_lock:
+                if self._fsr_read_inflight is owner:
+                    self._fsr_read_inflight = None
             return False
         return True
 

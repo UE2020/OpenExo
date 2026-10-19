@@ -66,6 +66,11 @@ void ComsMCU::handle_ble()
     #endif
 
     bool non_empty_ble_queue = _exo_ble->handle_updates();
+    if (_fsr_requested && !_exo_ble->connected())
+    {
+        _fsr_requested = _fsr_ready = false;
+        _exo_ble->clear_fsr_threshold_status();
+    }
 
     // Only negotiated sessions generate link supervision or new notifications.
     if (_perturbation_requested)
@@ -153,7 +158,16 @@ void ComsMCU::update_UART()
 
         if (msg.command)
         {
-            if (msg.command == ankle_perturbation::wire::status)
+            if (msg.command == fsr_thresholds::status)
+            {
+                fsr_thresholds::Snapshot event;
+                if (_fsr_requested && _exo_ble->connected() && fsr_thresholds::unpack(msg, event))
+                {
+                    if (event.id == 0 && event.state == 0) _fsr_ready = true;
+                    if (_fsr_ready) _exo_ble->send_fsr_threshold_status(event);
+                }
+            }
+            else if (msg.command == ankle_perturbation::wire::status)
             {
                 ankle_perturbation::Status event;
                 if (_perturbation_requested && _exo_ble->connected() &&
@@ -374,6 +388,23 @@ void ComsMCU::_process_complete_gui_command(BleMessage* msg)
         UART_msg_t request{};
         if (_perturbation_ready && msg->is_complete &&
             ankle_perturbation::wire::from_ble(msg->data, msg->expecting, request))
+            UARTHandler::get_instance()->UART_msg(request);
+        break;
+    }
+    case ble_names::fsr_threshold_query:
+    {
+        if (!msg->is_complete || msg->expecting != 0) break;
+        _fsr_requested = true;
+        _fsr_ready = false;
+        _exo_ble->clear_fsr_threshold_status();
+        UART_msg_t query{};query.command = fsr_thresholds::query;
+        UARTHandler::get_instance()->UART_msg(query);
+        break;
+    }
+    case ble_names::fsr_threshold_request:
+    {
+        UART_msg_t request{};
+        if (_fsr_ready && msg->is_complete && fsr_thresholds::from_ble(msg->data, msg->expecting, request))
             UARTHandler::get_instance()->UART_msg(request);
         break;
     }

@@ -66,6 +66,14 @@ namespace ankle_perturbation
         }
 
         uint8_t side() const { return _status.side; }
+        bool busy() const { return _status.state == armed || _status.state == active; }
+        void require_unload() { _require_unload[0] = _require_unload[1] = true; }
+        bool contact_ready(uint8_t side, bool loaded)
+        {
+            if (side != 1 && side != 2) return false;
+            if (!loaded) _require_unload[side - 1] = false;
+            return !_require_unload[side - 1];
+        }
 
         void request(uint8_t side, float magnitude, uint16_t duration,
                      uint16_t request_id, uint32_t now, bool allowed, uint8_t denial = unsafe_state)
@@ -148,6 +156,7 @@ namespace ankle_perturbation
         Status _events[8];
         uint8_t _head = 0, _count = 0;
         bool _session = false;
+        bool _require_unload[2] = {false, false};
         uint16_t _high_water_id = 0;
         uint32_t _last_link = 0, _armed_at = 0, _started_at = 0;
     };

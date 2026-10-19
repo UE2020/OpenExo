@@ -186,6 +186,7 @@ bool ExoBLE::setup()
     _gatt_db.UARTService.addCharacteristic(_gatt_db.TXChar);
     _gatt_db.UARTService.addCharacteristic(_gatt_db.RXChar);
     _gatt_db.UARTService.addCharacteristic(_gatt_db.PerturbationStatusChar);
+    _gatt_db.UARTService.addCharacteristic(_gatt_db.FsrThresholdStatusChar);
 
     //Device Info Chars
     _gatt_db.UARTServiceDeviceInfo.addCharacteristic(_gatt_db.PCBChar);
@@ -372,6 +373,20 @@ bool ExoBLE::send_message(BleMessage &msg)
         return false;
     }
     return true;
+}
+
+bool ExoBLE::send_fsr_threshold_status(const fsr_thresholds::Snapshot& event)
+{
+    if (!_connected) return false;
+    uint8_t bytes[16];
+    const int length = fsr_thresholds::pack_readback(event, bytes, sizeof(bytes));
+    return length && _gatt_db.FsrThresholdStatusChar.writeValue(bytes, length) > 0;
+}
+
+void ExoBLE::clear_fsr_threshold_status()
+{
+    const uint8_t empty = 0;
+    _gatt_db.FsrThresholdStatusChar.writeValue(&empty, 0);
 }
 
 bool ExoBLE::send_perturbation_status(const ankle_perturbation::Status& event)

@@ -99,6 +99,8 @@ class ComsMCU
         const int _mark_index = 1;
         bool _perturbation_requested = false;
         bool _perturbation_ready = false;
+        bool _fsr_requested = false;
+        bool _fsr_ready = false;
         uint32_t _last_perturbation_link_ms = 0;
         bool _reset_pending = false;
         uint32_t _reset_start_ms = 0;

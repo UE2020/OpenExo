@@ -26,6 +26,7 @@
 #include "BleMessage.h"
 #include "BleMessageQueue.h"
 #include "AnklePerturbationProtocol.h"
+#include "FsrThresholds.h"
 
 class ExoBLE 
 {
@@ -71,6 +72,8 @@ class ExoBLE
         bool send_message(BleMessage &msg);
         bool connected() const { return _connected > 0; }
         bool send_perturbation_status(const ankle_perturbation::Status& event);
+        bool send_fsr_threshold_status(const fsr_thresholds::Snapshot& event);
+        void clear_fsr_threshold_status();
 
         /**
          * @brief Send an error code to the GUI, uses a seperate service and characteristic

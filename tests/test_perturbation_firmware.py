@@ -291,6 +291,7 @@ def test_real_nano_dispatch_negotiation_and_disconnect_supervision(tmp_path):
 #define UARTMSG_H
 struct UART_msg_t {uint8_t command=0,joint_id=0;float data[128]={};uint8_t len=0;};
 #include "AnklePerturbationProtocol.h"
+#include "FsrThresholds.h"
 #include <cassert>
 #include <vector>
 uint32_t now=0;uint32_t millis(){return now;}
@@ -309,11 +310,15 @@ struct Time_Helper {static Time_Helper* get_instance(){static Time_Helper t;retu
 namespace UART_times {constexpr int UPDATE_PERIOD=0,COMS_MCU_TIMEOUT=0;}
 namespace UART_command_utils {void handle_msg(UARTHandler*,ExoData*,UART_msg_t){}}
 struct ExoBLE {bool connected_flag=true;std::vector<ankle_perturbation::Status> events;
+ std::vector<fsr_thresholds::Snapshot> settings;
+ void clear_fsr_threshold_status(){}
+ bool send_fsr_threshold_status(const fsr_thresholds::Snapshot& s){settings.push_back(s);return true;}
  bool connected(){return connected_flag;}bool handle_updates(){return ble_queue::size();}
  bool send_perturbation_status(const ankle_perturbation::Status& s){events.push_back(s);return true;}};
 struct ComsMCU {
  ExoData* _data=nullptr;ExoBLE ble;ExoBLE* _exo_ble=&ble;
  bool _perturbation_requested=false,_perturbation_ready=false;uint32_t _last_perturbation_link_ms=0;
+ bool _fsr_requested=false,_fsr_ready=false;
  void _send_param_update_ack(UART_msg_t){}
  void _process_complete_gui_command(BleMessage* msg);
  void handle_ble();void update_UART();
@@ -344,6 +349,17 @@ int main(){
  assert(uart->sent.back().command==wire::link && uart->sent.back().data[0]==0);
  assert(!c._perturbation_ready && !c._perturbation_requested);
  n=uart->sent.size();c._process_complete_gui_command(&arm);assert(uart->sent.size()==n);
+ c.ble.connected_flag=true;BleMessage config;config.command='k';config.expecting=4;
+ config.data[0]=1;config.data[1]=.35f;config.data[2]=.45f;config.data[3]=9999;
+ c._process_complete_gui_command(&config);assert(uart->sent.size()==n);
+ BleMessage probe;probe.command='K';c._process_complete_gui_command(&probe);
+ assert(uart->sent.back().command==fsr_thresholds::query && !c._fsr_ready);
+ n=uart->sent.size();c._process_complete_gui_command(&config);assert(uart->sent.size()==n);
+ uart->received.push_back(fsr_thresholds::pack(fsr_thresholds::Snapshot{}));c.update_UART();
+ assert(c._fsr_ready && c.ble.settings.size()==1);
+ c._process_complete_gui_command(&config);
+ assert(uart->sent.back().command==fsr_thresholds::request && uart->sent.back().joint_id==39);
+ c.ble.connected_flag=false;c.handle_ble();assert(!c._fsr_ready && !c._fsr_requested);
 }
 ''')
 

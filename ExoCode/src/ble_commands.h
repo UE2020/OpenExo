@@ -54,6 +54,8 @@ namespace ble_names
     static const char reset_system      = 'Z';
     static const char perturbation_query = 'J';
     static const char perturbation_request = 'j';
+    static const char fsr_threshold_query = 'K';
+    static const char fsr_threshold_request = 'k';
 
     //Sending Commands (Firmware->GUI)
     static const char send_real_time_data = '?';
@@ -91,6 +93,8 @@ namespace ble
         {ble_names::reset_system,       0},
         {ble_names::perturbation_query, 0},
         {ble_names::perturbation_request, 4},
+        {ble_names::fsr_threshold_query, 0},
+        {ble_names::fsr_threshold_request, 4},
         
         //Sending Commands
         {ble_names::send_batt,              1},

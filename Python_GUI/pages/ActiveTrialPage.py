@@ -36,6 +36,8 @@ class ActiveTrialPage(QtWidgets.QWidget):
     markTrialRequested = QtCore.Signal()
     deviceStartRequested = QtCore.Signal()
     deviceStopRequested = QtCore.Signal()
+    fsrReadRequested = QtCore.Signal()
+    fsrApplyRequested = QtCore.Signal(float, float)
     perturbationArmRequested = QtCore.Signal(int, float, int)
     perturbationCancelRequested = QtCore.Signal()
     perturbationCheckRequested = QtCore.Signal()
@@ -156,7 +158,7 @@ class ActiveTrialPage(QtWidgets.QWidget):
 
         controls.addWidget(create_section_label("Ankle Perturbation"))
         self.lbl_impulse_help = QtWidgets.QLabel(
-            "One pulse at next step onset. Added to assistance/PID target.")
+            "One pulse at next forefoot loading. Added to assistance/PID target.")
         self.lbl_impulse_help.setWordWrap(True)
         controls.addWidget(self.lbl_impulse_help)
         impulse_form = QtWidgets.QFormLayout()
@@ -196,6 +198,41 @@ class ActiveTrialPage(QtWidgets.QWidget):
         controls.addWidget(self.lbl_impulse_status)
         self.btn_check_impulse.clicked.connect(self.perturbationCheckRequested.emit)
         self.btn_cancel_impulse.clicked.connect(self.perturbationCancelRequested.emit)
+
+        controls.addWidget(create_section_label("Forefoot Contact Thresholds"))
+        fsr_help = QtWidgets.QLabel("Shared stance detector · normalized FSR. Pause and disarm to apply.")
+        fsr_help.setWordWrap(True)
+        controls.addWidget(fsr_help)
+        fsr_form = QtWidgets.QFormLayout()
+        self.spin_fsr_left = QtWidgets.QDoubleSpinBox()
+        self.spin_fsr_right = QtWidgets.QDoubleSpinBox()
+        for spin in (self.spin_fsr_left, self.spin_fsr_right):
+            spin.setRange(.06, .94)
+            spin.setDecimals(2)
+            spin.setSingleStep(.01)
+            spin.setValue(.25)
+        fsr_form.addRow("Left center", self.spin_fsr_left)
+        fsr_form.addRow("Right center", self.spin_fsr_right)
+        controls.addLayout(fsr_form)
+        self.lbl_fsr_preview = QtWidgets.QLabel()
+        self.lbl_fsr_preview.setWordWrap(True)
+        controls.addWidget(self.lbl_fsr_preview)
+        for spin in (self.spin_fsr_left, self.spin_fsr_right):
+            spin.valueChanged.connect(self._update_fsr_preview)
+        self._update_fsr_preview()
+        fsr_buttons = QtWidgets.QHBoxLayout()
+        self.btn_read_fsr = QtWidgets.QPushButton("Read Settings")
+        self.btn_apply_fsr = QtWidgets.QPushButton("Apply")
+        self.btn_apply_fsr.setEnabled(False)
+        fsr_buttons.addWidget(self.btn_read_fsr)
+        fsr_buttons.addWidget(self.btn_apply_fsr)
+        controls.addLayout(fsr_buttons)
+        self.lbl_fsr_status = QtWidgets.QLabel("Settings not yet confirmed")
+        self.lbl_fsr_status.setWordWrap(True)
+        controls.addWidget(self.lbl_fsr_status)
+        self.btn_read_fsr.clicked.connect(self.fsrReadRequested.emit)
+        self.btn_apply_fsr.clicked.connect(lambda: self.fsrApplyRequested.emit(
+            self.spin_fsr_left.value(), self.spin_fsr_right.value()))
         
         # Separator
         controls.addSpacing(UIConfig.SPACING_XLARGE)
@@ -396,6 +433,19 @@ class ActiveTrialPage(QtWidgets.QWidget):
         self._param_names = []
         # Track real data start time
         self._real_data_t0 = None
+
+    def _update_fsr_preview(self):
+        left, right = self.spin_fsr_left.value(), self.spin_fsr_right.value()
+        self.lbl_fsr_preview.setText(
+            f"Requested: L ON {left+.05:.2f} / OFF {left-.05:.2f}; "
+            f"R ON {right+.05:.2f} / OFF {right-.05:.2f}")
+
+    def set_fsr_threshold_state(self, ready, pending, message):
+        self.btn_apply_fsr.setEnabled(ready)
+        self.btn_read_fsr.setEnabled(not pending)
+        self.spin_fsr_left.setEnabled(ready)
+        self.spin_fsr_right.setEnabled(ready)
+        self.lbl_fsr_status.setText(message)
 
     def set_perturbation_state(self, ready: bool, busy: bool, message: str):
         self.btn_arm_left.setEnabled(ready)

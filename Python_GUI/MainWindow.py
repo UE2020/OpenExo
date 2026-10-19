@@ -88,6 +88,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.trial_page.perturbationCancelRequested.connect(self.perturbation.cancel)
         self.trial_page.perturbationCheckRequested.connect(self.perturbation.check_firmware)
         self.qt_dev.disconnected.connect(self.perturbation.reset)
+        from services.FsrThresholds import FsrThresholdSession
+        self.fsr_thresholds = FsrThresholdSession(self.qt_dev, self.perturbation, self)
+        self.fsr_thresholds.changed.connect(self._update_fsr_threshold_ui)
+        self.fsr_thresholds.event.connect(self._on_fsr_threshold_event)
+        self.trial_page.fsrReadRequested.connect(self.fsr_thresholds.check)
+        self.trial_page.fsrApplyRequested.connect(self.fsr_thresholds.apply)
+        self.qt_dev.fsrThresholdStatusReceived.connect(self.fsr_thresholds.receive)
+        self.qt_dev.disconnected.connect(self.fsr_thresholds.reset)
         # Bind scan page scanner to use the Qt device manager for scanning
         try:
             self.scan_page.bind_device_manager(self.qt_dev)
@@ -160,7 +168,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_perturbation_ui(self):
         session = self.perturbation
-        self.trial_page.set_perturbation_state(session.ready, session.busy, session.message)
+        settings = getattr(self, 'fsr_thresholds', None)
+        blocked = settings is not None and (settings.pending or settings.uncertain)
+        self.trial_page.set_perturbation_state(session.ready and not blocked, session.busy, session.message)
 
     def _on_perturbation_event(self, event):
         self.logger.info("Perturbation firmware event (GUI receipt time): %s", event)
@@ -174,6 +184,34 @@ class MainWindow(QtWidgets.QMainWindow):
                     output.write(json.dumps(record, allow_nan=False) + "\n")
             except (OSError, ValueError):
                 self.logger.exception("Could not save perturbation event sidecar")
+
+    def _update_fsr_threshold_ui(self):
+        settings = self.fsr_thresholds
+        self.trial_page.set_fsr_threshold_state(settings.ready, settings.pending, settings.message)
+        self.trial_page.btn_read_fsr.setEnabled(not settings.pending and not self.perturbation.busy)
+        self.trial_page.btn_pause_play.setEnabled(
+            not getattr(self, '_device_paused', False) or not (settings.pending or settings.uncertain))
+        self._update_perturbation_ui()
+
+    def _on_fsr_threshold_event(self, event):
+        self.logger.info("FSR settings control-MCU reply: %s", event)
+        from services.FsrThresholds import valid_center
+        confirmed = self.fsr_thresholds.confirmed
+        left, right = confirmed if confirmed is not None else (None, None)
+        if event['state'] != 3 and confirmed is not None and valid_center(left) and valid_center(right):
+            self.qt_dev._curr_left_fsr_value = left
+            self.qt_dev._curr_right_fsr_value = right
+            if event['state'] != 3:
+                self.trial_page.spin_fsr_left.setValue(left)
+                self.trial_page.spin_fsr_right.setValue(right)
+        if self._csv_file is not None:
+            import json
+            record = dict(epoch=time.time(), timestamp_kind='gui_receipt', event=event)
+            try:
+                with open(self._csv_file.name + '.fsr_thresholds.jsonl', 'a', encoding='utf-8') as output:
+                    output.write(json.dumps(record, allow_nan=False) + '\n')
+            except (OSError, ValueError):
+                self.logger.exception("Could not save FSR settings sidecar")
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -209,6 +247,7 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.Slot(str)
     def _on_connect_requested(self, mac: str):
         self.perturbation.reset()
+        self.fsr_thresholds.reset()
         # Start BLE connection via Qt device manager
         try:
             # Clear partial handshake/stream state before notifications for the
@@ -553,6 +592,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot()
     def _on_device_start(self):
+        settings = getattr(self, 'fsr_thresholds', None)
+        if settings is not None and (settings.pending or settings.uncertain):
+            return
         # Resume motors (play functionality) - just turn motors back on
         try:
             self.logger.info("Turning motors ON")
@@ -560,6 +602,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.qt_dev.motorOn()
             if hasattr(self, "perturbation"):
                 self.perturbation.set_running(True)
+            if settings is not None:
+                settings.set_paused(False)
             if self._csv_file is not None:
                 self.trial_page.set_recording_state(True, "Recording")
         except Exception as e:
@@ -575,6 +619,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.qt_dev.motorOff()
             if hasattr(self, "perturbation"):
                 self.perturbation.set_running(False)
+            settings = getattr(self, 'fsr_thresholds', None)
+            if settings is not None:
+                settings.set_paused(True)
+                settings.check()
             if self._csv_file is not None:
                 self.trial_page.set_recording_state(True, "Recording (exo paused)")
         except Exception as e:
@@ -594,7 +642,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_send_preset_fsr(self):
         try:
             self.logger.info("Sending preset FSR values")
-            self.qt_dev.sendPresetFsrValues()
+            self.fsr_thresholds.apply(self.trial_page.spin_fsr_left.value(),
+                                      self.trial_page.spin_fsr_right.value())
         except Exception as e:
             self.logger.error(f"Failed to send preset FSR values: {e}")
             self.logger.debug(traceback.format_exc())
